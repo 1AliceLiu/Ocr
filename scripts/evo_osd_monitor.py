@@ -7,6 +7,7 @@ for a fresh URL per channel and uses it immediately.
 Default behaviour:
   * input  : out/streams.txt (first 20 channels)
   * stream : main stream (1920x1080 or larger), no resizing
+  * frames : 3 consecutive frames per channel, OCR each, majority vote
   * ROI    : bottom-left corner, (43, 971) - (219, 1040) in 1080p coordinates
   * output : output.txt, one tab-separated line per channel per round:
              time  expected  detected  channelCode  channelName  confidence  status
@@ -46,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evo_pull import START_VIDEO, STOP_VIDEO, Platform, is_ok, pick_rtsp  # noqa: E402
 from evo_snapshot import read_channels, safe_name  # noqa: E402
+from osd_ocr import majority, read_number  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -75,32 +77,47 @@ def crop_roi(frame):
     return frame[Y1:Y2, X1:X2]
 
 
-def grab_frame(ffmpeg: str, url: str, timeout: float, target: Path,
-               keep: bool, skip_frames: int = 10):
-    """Grab one frame with the ffmpeg CLI (much faster than cv2 VideoCapture).
+def grab_frames(ffmpeg: str, url: str, timeout: float, target: Path,
+                skip_frames: int = 10, count: int = 3):
+    """Grab `count` consecutive frames with the ffmpeg CLI.
 
     HEVC streams start with frames whose references are missing, which decode
-    to a grey image. Selecting frame N>=skip_frames avoids that.
+    to a grey image. Selecting frame N>=skip_frames avoids that. One RTSP
+    connection is used for all frames (the stream token is single-use).
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+    for old in target.parent.glob(f"{target.stem}_*{target.suffix}"):
+        old.unlink(missing_ok=True)
     target.unlink(missing_ok=True)
+
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
         "-rtsp_transport", "tcp", "-i", url,
     ]
     if skip_frames > 0:
         cmd += ["-vf", rf"select=gte(n\,{skip_frames})"]
-    cmd += ["-frames:v", "1", "-q:v", "2", "-y", str(target)]
+    pattern = None
+    if count > 1:
+        pattern = target.with_name(f"{target.stem}_%02d{target.suffix}")
+        cmd += ["-frames:v", str(count), "-fps_mode", "passthrough",
+                "-q:v", "2", "-y", str(pattern)]
+    else:
+        cmd += ["-frames:v", "1", "-q:v", "2", "-y", str(target)]
+
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None
-    if not target.exists() or target.stat().st_size < 1024:
-        return None
-    frame = cv2.imread(str(target), cv2.IMREAD_COLOR)
-    if not keep:
-        target.unlink(missing_ok=True)
-    return frame
+        return []
+    paths = (sorted(target.parent.glob(f"{target.stem}_*{target.suffix}"))
+             if pattern else [target])
+    frames = []
+    for path in paths:
+        if path.exists() and path.stat().st_size >= 1024:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is not None:
+                frames.append(frame)
+        path.unlink(missing_ok=True)
+    return frames
 
 
 class Monitor:
@@ -150,7 +167,7 @@ class Monitor:
             "status": "CAPTURE_FAILED",
             "time": now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        frame = None
+        frames = []
         reason = ""
         for _ in range(1 + max(0, self.args.retries)):
             body, data, url = self._start(code)
@@ -161,26 +178,38 @@ class Monitor:
                 target = (self.save_dir / safe_name(channel["index"], code)
                           if self.save_dir else
                           Path(tempfile.gettempdir()) / f"osd_{channel['index']}.jpg")
-                frame = grab_frame(self.ffmpeg, url, self.args.timeout,
-                                   target, keep=bool(self.save_dir),
-                                   skip_frames=self.args.skip_frames)
+                frames = grab_frames(self.ffmpeg, url, self.args.timeout,
+                                     target, skip_frames=self.args.skip_frames,
+                                     count=self.args.frames)
             finally:
                 self._stop(code, data.get("session"))
-            if frame is not None:
+            if frames:
                 break
             reason = "capture timeout"
 
-        if frame is None:
+        if not frames:
             result["status"] = f"CAPTURE_FAILED({reason})" if reason else "CAPTURE_FAILED"
             return result
 
-        roi = crop_roi(frame)
+        expected_len = len(result["expected"]) or None
+        candidates = []
         with self.ocr_lock:
-            detections = self.reader.readtext(
-                roi, allowlist="0123456789", detail=1, paragraph=False)
-        detected = "".join(item[1] for item in detections).strip()
-        confidence = min((float(item[2]) for item in detections), default=0.0)
+            for frame in frames:
+                text, conf, _src = read_number(
+                    self.reader, crop_roi(frame), expected_len)
+                candidates.append((text, conf, frame))
 
+        # The OSD number is constant, so the most frequent reading wins.
+        detected = majority([c[0] for c in candidates])
+        matches = [c for c in candidates if detected and c[0] == detected]
+        confidence = max((c[1] for c in matches), default=0.0)
+
+        if self.save_dir:
+            best = max(matches, key=lambda c: c[1]) if matches else candidates[0]
+            cv2.imwrite(str(self.save_dir / safe_name(channel["index"], code)),
+                        best[2])
+
+        result["votes"] = [c[0] for c in candidates]
         result["detected"] = detected
         result["confidence"] = confidence
         if not detected:
@@ -227,6 +256,8 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--stream-type", choices=["1", "2"], default="1",
                         help="1=main stream (1080p), 2=sub stream")
+    parser.add_argument("--frames", type=int, default=3,
+                        help="frames per channel per round, majority-voted")
     parser.add_argument("--retries", type=int, default=1,
                         help="retry a failed capture with a fresh token")
     parser.add_argument("--skip-frames", type=int, default=10,

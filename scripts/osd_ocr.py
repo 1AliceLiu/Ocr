@@ -43,6 +43,18 @@ def stretch_bgr(roi: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(grey, cv2.COLOR_GRAY2BGR)
 
 
+def scale_box(box, width: int, height: int):
+    """Map a 1080p ROI to the actual frame size.
+
+    Panorama frames (aspect > 2.5) keep the x coordinates: their OSD sits in
+    the left 1920px panel, so scaling x by the full width would move it away.
+    """
+    x1, y1, x2, y2 = box
+    sy = height / 1080.0
+    sx = sy if width / height < 2.5 else 1.0
+    return (round(x1 * sx), round(y1 * sy), round(x2 * sx), round(y2 * sy))
+
+
 def upscale(img: np.ndarray, scale: int = 3) -> np.ndarray:
     return cv2.resize(img, None, fx=scale, fy=scale,
                       interpolation=cv2.INTER_CUBIC)

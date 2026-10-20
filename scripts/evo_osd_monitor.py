@@ -57,6 +57,7 @@ from osd_ocr import (  # noqa: E402
     detect_roi,
     majority,
     read_number,
+    scale_box,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -163,13 +164,14 @@ class Monitor:
 
     def roi_options(self, frame, channel_code: str, expected: str):
         """ROIs to try, best first. Adaptive = narrow for numeric labels."""
+        height, width = frame.shape[:2]
         custom = (self.roi_map.get(channel_code)
                   or self.roi_map.get("*"))
         if custom:
-            x1, y1, x2, y2 = custom
+            x1, y1, x2, y2 = scale_box(custom, width, height)
             return [frame[y1:y2, x1:x2]]
         if self.roi:
-            x1, y1, x2, y2 = self.roi
+            x1, y1, x2, y2 = scale_box(self.roi, width, height)
             return [frame[y1:y2, x1:x2]]
 
         mode = self.args.roi_mode
@@ -182,7 +184,8 @@ class Monitor:
         else:  # adaptive
             boxes = ([FIXED_ROI, WIDE_ROI] if expected.isdigit()
                      else [WIDE_ROI, FIXED_ROI])
-        return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
+        scaled = [scale_box(box, width, height) for box in boxes]
+        return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in scaled]
 
     @staticmethod
     def is_good(text: str, expected: str) -> bool:

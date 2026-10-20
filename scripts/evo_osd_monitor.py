@@ -273,9 +273,8 @@ class Monitor:
         elif mode == "wide":
             boxes = [scale_box(WIDE_ROI, width, height)]
         else:  # adaptive
-            narrow = scale_box(FIXED_ROI, width, height)
-            wide = scale_box(WIDE_ROI, width, height)
-            boxes = ([narrow, wide] if expected.isdigit() else [wide, narrow])
+            boxes = ([FIXED_ROI, WIDE_ROI] if expected.isdigit()
+                     else [WIDE_ROI, FIXED_ROI])
         return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
 
     @staticmethod

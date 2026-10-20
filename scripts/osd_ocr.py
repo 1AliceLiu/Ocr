@@ -123,9 +123,10 @@ def detect_roi(frame: np.ndarray, base=(0, 900, 700, 1080),
     return region[by1:by2, bx1:bx2]
 
 
-def _read(reader, image, allowlist: str):
+def _read(reader, image, allowlist: str, mag_ratio: float = 1.0):
     detections = reader.readtext(
-        image, allowlist=allowlist, detail=1, paragraph=False)
+        image, allowlist=allowlist, detail=1, paragraph=False,
+        mag_ratio=mag_ratio)
     text = "".join(item[1] for item in detections).strip()
     confidence = min((float(item[2]) for item in detections), default=0.0)
     return text, confidence
@@ -133,18 +134,20 @@ def _read(reader, image, allowlist: str):
 
 def read_number(reader, roi: np.ndarray, expected_len: int | None = None,
                 allowlist: str = ALLOW_DIGITS,
-                numeric_expected: bool = False):
+                numeric_expected: bool = False,
+                mag_ratio: float = 1.0):
     """Return (text, confidence, source) using two complementary variants.
 
     `allowlist` controls the character set. Use ALLOW_ALNUM for codes such as
     "P40A2-087"; the raw string (letters and dashes included) is preserved.
+    `mag_ratio` is forwarded to EasyOCR (the crop is already upscaled 3x).
     """
     candidates = []
     for source, image in (
         ("raw", upscale(roi)),
         ("stretch", upscale(binarize_robust(roi))),
     ):
-        text, confidence = _read(reader, image, allowlist)
+        text, confidence = _read(reader, image, allowlist, mag_ratio)
         candidates.append((text, confidence, source))
 
     # A numeric channel label is a strong prior: prefer a digit-only reading

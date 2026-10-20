@@ -8,6 +8,7 @@ output/
 
 # Data / generated media
 *.png
+*.jpg
 dataset/
 snapshots/
 

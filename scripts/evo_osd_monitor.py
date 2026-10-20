@@ -1,19 +1,21 @@
-"""Grab a 1080p frame from every channel and OCR the OSD, round after round.
+"""Grab a 1080p keyframe from every channel and OCR the OSD, round after round.
 
 Results are written to disk as soon as each channel finishes (line-buffered),
 so output.txt / osd_error.txt grow in real time instead of at round end.
 
-This is the token-aware version of rtsp_osd_monitor.py. The platform's RTSP
-token lives ~30 seconds and is single-use, so each round asks MTS/StartVideo
-for a fresh URL per channel and uses it immediately.
+Token-aware: the platform's RTSP token lives ~30 seconds and is single-use, so
+each round asks MTS/StartVideo for a fresh URL per channel and uses it
+immediately.
 
 Default behaviour:
   * input  : out/streams.txt (all channels)
   * stream : main stream (1920x1080 or larger), no resizing
-  * frame  : only keyframes are decoded (`-skip_frame nokey`), because joining a
-             live stream mid-GOP yields grey frames with missing references
-  * ROI    : bottom-left corner, anchored to the bottom edge, roughly
-             0..300 x (h-150)..(h-8); works for 1080p/1440p/4MP/panorama
+  * frames : keyframes only (`-skip_frame nokey`), 1 per channel by default;
+             `--frames N` majority-votes N keyframes (slower: one GOP each)
+  * ROI    : adaptive by default: narrow (43,971)-(219,1040) for numeric
+             labels, wide (0,920)-(520,1080) for alphanumeric codes; the boxes
+             are scaled to the real frame height; override with --roi/--roi-file
+  * chars  : alphanumeric by default (P40A2-087); --allowlist digits for 0-9
   * output : output.txt, one tab-separated line per channel per round:
              time  expected  detected  channelCode  channelName  confidence  status
              `--output-rotate-hours N` empties output.txt every N hours.
@@ -21,7 +23,7 @@ Default behaviour:
              snapshots/osd20/<index>_<code>.jpg (latest frame, overwritten)
 
 Anomaly handling (everything not OK = MISMATCH / NO_OCR / NO_EXPECTED / CAPTURE_FAILED):
-  * `--error-log PATH`  appends the abnormal rows of each finished round to PATH
+  * `--error-log PATH`  appends the abnormal rows of each round to PATH
     (e.g. output/osd_error.txt), preceded by a `# round N <time>` marker.
     `CAPTURE_FAILED(capture timeout)` rows are NOT written there: a timeout is a
     stream/network problem, not an OSD anomaly (they stay in output.txt).
@@ -38,7 +40,7 @@ Run it inside the easyocr container (it has cv2 + easyocr):
     docker compose exec -e EVO_BASE=... -e EVO_USER=... -e EVO_PASSWORD=... \
         easyocr python /work/scripts/evo_osd_monitor.py --once
 
-    # continuous, every 60 seconds
+    # continuous
     docker compose exec -e ... easyocr python /work/scripts/evo_osd_monitor.py
 """
 from __future__ import annotations
@@ -46,6 +48,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import json
 import os
 import re
 import subprocess
@@ -65,22 +68,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evo_pull import START_VIDEO, STOP_VIDEO, Platform, is_ok, pick_rtsp  # noqa: E402
 from evo_snapshot import read_channels, safe_name  # noqa: E402
+from osd_ocr import (  # noqa: E402
+    ALLOW_ALNUM,
+    ALLOW_DIGITS,
+    detect_roi,
+    majority,
+    read_number,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-# OSD reference box on a 1920x1080 frame: x 43..219, y 971..1040.
+# Bottom-left OSD ROI for a 1920x1080 frame: (x1, y1, x2, y2).
+X1, Y1, X2, Y2 = 43, 971, 219, 1040
+FIXED_ROI = (X1, Y1, X2, Y2)
+WIDE_ROI = (0, 920, 520, 1080)
+
 # The OSD is anchored bottom-left and keeps roughly the same pixel height on
-# 4MP/5MP/panorama cameras, so the ROI is taken relative to the bottom edge
-# with some margin instead of using absolute 1080p coordinates.
-OSD_X_MAX = 300          # right edge of the box, also capped at 12% of width
+# 4MP/5MP/panorama cameras, so these boxes are measured from the bottom edge.
+OSD_X_MAX = 300          # right edge of the bottom box, capped at 12% of width
 OSD_X_FRAC = 0.12
 OSD_BOTTOM_MARGIN = 8    # pixels to ignore at the very bottom
 OSD_HEIGHT = 150         # box height above that margin
-# Below this EasyOCR confidence a keyframe is considered bad and another one is
-# grabbed (a blurred keyframe or one captured mid OSD update).
-OCR_MIN_CONF = 0.60
+ROI_BASE_HEIGHT = 180    # search band for content-based ROI detection
+ROI_BASE_WIDTH = 760
+
 BEIJING_TZ = timezone(timedelta(hours=8))
-DIGITS = re.compile(r"\D")
+NON_ALNUM = re.compile(r"[^0-9A-Za-z]")
+# Common digit/letter confusions on the OSD font; applied only when the
+# expected channel code is numeric.
+DIGIT_CONFUSIONS = str.maketrans({"O": "0", "o": "0", "I": "1",
+                                  "i": "1", "l": "1", "|": "1"})
 
 
 def now_beijing() -> datetime:
@@ -88,12 +105,58 @@ def now_beijing() -> datetime:
 
 
 def expected_code(name: str) -> str:
-    match = re.search(r"\d+", name or "")
-    return match.group(0) if match else ""
+    """'P40A2-087_1' -> 'P40A2-087'; '2544_1' -> '2544'."""
+    stem = re.sub(r"_\d+$", "", name or "")
+    if "-" in stem and re.search(r"[A-Za-z]", stem):
+        return stem
+    match = re.search(r"\d+", stem)
+    return match.group(0) if match else stem
 
 
 def canonical(text: str) -> str:
-    return DIGITS.sub("", text or "")
+    """Compare codes ignoring case, spaces and separators (keeps letters)."""
+    return NON_ALNUM.sub("", text or "").upper()
+
+
+def parse_roi(text: str) -> tuple[int, int, int, int]:
+    try:
+        x1, y1, x2, y2 = (int(part) for part in text.split(","))
+    except ValueError as exc:
+        raise SystemExit("--roi must be x1,y1,x2,y2") from exc
+    return x1, y1, x2, y2
+
+
+def scale_box(box: tuple[int, int, int, int], width: int,
+              height: int) -> tuple[int, int, int, int]:
+    """Scale a 1080p reference box to the real frame, with a little margin.
+
+    Some 4MP/5MP cameras draw the OSD a few pixels further left than a strict
+    h/1080 scaling predicts, so the left/top edges are padded.
+    """
+    factor = height / 1080.0
+    x1, y1, x2, y2 = box
+    x1 = max(0, int(x1 * factor) - 20)
+    y1 = max(0, int(y1 * factor) - 10)
+    x2 = min(width, int(x2 * factor))
+    y2 = min(height, int(y2 * factor))
+    return x1, y1, x2, y2
+
+
+def crop_roi(frame):
+    """Bottom-anchored fallback box (works for 1080p/1440p/4MP/panorama)."""
+    height, width = frame.shape[:2]
+    x2 = min(int(width * OSD_X_FRAC), OSD_X_MAX)
+    y2 = height - OSD_BOTTOM_MARGIN
+    y1 = max(0, height - OSD_HEIGHT)
+    if x2 < 40 or y2 - y1 < 20:
+        raise ValueError(f"frame too small for ROI: {width}x{height}")
+    return frame[y1:y2, 0:x2]
+
+
+def roi_base(frame):
+    """Bottom-left band searched by the content-based ROI detector."""
+    height, width = frame.shape[:2]
+    return (0, max(0, height - ROI_BASE_HEIGHT), min(width, ROI_BASE_WIDTH), height)
 
 
 def is_capture_timeout(status: str) -> bool:
@@ -111,43 +174,57 @@ def is_logged_anomaly(status: str) -> bool:
     return status != "OK" and not is_capture_timeout(status)
 
 
-def crop_roi(frame):
-    height, width = frame.shape[:2]
-    x2 = min(int(width * OSD_X_FRAC), OSD_X_MAX)
-    y2 = height - OSD_BOTTOM_MARGIN
-    y1 = max(0, height - OSD_HEIGHT)
-    if x2 < 40 or y2 - y1 < 20:
-        raise ValueError(f"frame too small for ROI: {width}x{height}")
-    return frame[y1:y2, 0:x2]
+def grab_frames(ffmpeg: str, url: str, timeout: float, target: Path,
+                skip_frames: int = 10, count: int = 3,
+                keyframes: bool = True):
+    """Grab `count` frames with the ffmpeg CLI, one RTSP connection.
 
+    `keyframes=True` decodes only keyframes: joining a live HEVC/H.264 stream
+    mid-GOP makes the leading pictures reference frames that were never
+    received ("Could not find ref with POC ..."), which decode to grey blocks
+    and make OCR fail. A keyframe is a self-contained picture, so every captured
+    frame is complete. `keyframes=False` keeps the old "decode everything, then
+    skip the first N frames" behaviour.
 
-def grab_frame(ffmpeg: str, url: str, timeout: float, target: Path,
-               keep: bool):
-    """Grab one complete frame with the ffmpeg CLI (faster than cv2 VideoCapture).
-
-    `-skip_frame nokey` decodes only keyframes: joining a live HEVC/H.264 stream
-    mid-GOP makes the first decoded pictures reference frames that were never
-    received ("Could not find ref with POC ..."), which look like grey blocks and
-    make OCR fail. A keyframe is a self-contained picture, so the first one is
-    already a stable, fully decoded frame.
+    All frames share one connection because the stream token is single-use.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+    for old in target.parent.glob(f"{target.stem}_*{target.suffix}"):
+        old.unlink(missing_ok=True)
     target.unlink(missing_ok=True)
+
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
-        "-rtsp_transport", "tcp", "-skip_frame", "nokey", "-i", url,
+        "-rtsp_transport", "tcp",
     ]
-    cmd += ["-frames:v", "1", "-q:v", "2", "-y", str(target)]
+    if keyframes:
+        cmd += ["-skip_frame", "nokey"]
+    cmd += ["-i", url]
+    if not keyframes and skip_frames > 0:
+        cmd += ["-vf", rf"select=gte(n\,{skip_frames})"]
+
+    pattern = None
+    if count > 1:
+        pattern = target.with_name(f"{target.stem}_%02d{target.suffix}")
+        cmd += ["-frames:v", str(count), "-fps_mode", "passthrough",
+                "-q:v", "2", "-y", str(pattern)]
+    else:
+        cmd += ["-frames:v", "1", "-q:v", "2", "-y", str(target)]
+
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        return None
-    if not target.exists() or target.stat().st_size < 1024:
-        return None
-    frame = cv2.imread(str(target), cv2.IMREAD_COLOR)
-    if not keep:
-        target.unlink(missing_ok=True)
-    return frame
+        return []
+    paths = (sorted(target.parent.glob(f"{target.stem}_*{target.suffix}"))
+             if pattern else [target])
+    frames = []
+    for path in paths:
+        if path.exists() and path.stat().st_size >= 1024:
+            frame = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if frame is not None:
+                frames.append(frame)
+        path.unlink(missing_ok=True)
+    return frames
 
 
 class Monitor:
@@ -164,6 +241,48 @@ class Monitor:
         if self.error_dir:
             self.error_dir.mkdir(parents=True, exist_ok=True)
         self.ffmpeg = args.ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
+        self.allowlist = (ALLOW_ALNUM if args.allowlist == "alnum"
+                          else ALLOW_DIGITS)
+        self.roi = parse_roi(args.roi) if args.roi else None
+        self.roi_map = {}
+        if args.roi_file:
+            with Path(args.roi_file).open(encoding="utf-8") as handle:
+                self.roi_map = json.load(handle)
+
+    def roi_options(self, frame, channel_code: str, expected: str):
+        """ROIs to try, best first. Adaptive = narrow for numeric labels."""
+        custom = (self.roi_map.get(channel_code)
+                  or self.roi_map.get("*"))
+        height, width = frame.shape[:2]
+        if custom:
+            x1, y1, x2, y2 = custom
+            return [frame[y1:y2, x1:x2]]
+        if self.roi:
+            x1, y1, x2, y2 = self.roi
+            return [frame[y1:y2, x1:x2]]
+
+        mode = self.args.roi_mode
+        if mode == "auto":
+            return [detect_roi(frame, base=roi_base(frame))]
+        if mode == "bottom":
+            return [crop_roi(frame)]
+        if mode == "fixed":
+            boxes = [scale_box(FIXED_ROI, width, height)]
+        elif mode == "wide":
+            boxes = [scale_box(WIDE_ROI, width, height)]
+        else:  # adaptive
+            narrow = scale_box(FIXED_ROI, width, height)
+            wide = scale_box(WIDE_ROI, width, height)
+            boxes = ([narrow, wide] if expected.isdigit() else [wide, narrow])
+        return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
+
+    @staticmethod
+    def is_good(text: str, expected: str) -> bool:
+        if not text:
+            return False
+        if expected.isdigit():
+            return text.isdigit() and len(text) == len(expected)
+        return any(ch.isalpha() for ch in text)
 
     def save_anomaly(self, channel: dict, frame) -> None:
         """Keep the full frame of a channel whose status is not OK."""
@@ -199,17 +318,6 @@ class Monitor:
                 "optModule": "ADMIN_001031",
             }})
 
-    def ocr(self, frame):
-        """Read the OSD digits in the bottom-left corner of one frame."""
-        roi = crop_roi(frame)
-        with self.ocr_lock:
-            detections = self.reader.readtext(
-                roi, allowlist="0123456789", detail=1, paragraph=False,
-                mag_ratio=self.args.mag_ratio)
-        text = "".join(item[1] for item in detections).strip()
-        confidence = min((float(item[2]) for item in detections), default=0.0)
-        return text, confidence
-
     def one(self, channel: dict) -> dict:
         code = channel["channelCode"]
         result = {
@@ -223,16 +331,19 @@ class Monitor:
             "time": now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
         }
         expected = result["expected"]
-        target_len = len(expected)
-        frame = None
+        expected_len = len(expected) or None
+        numeric = expected.isdigit()
+
+        frames: list = []
+        candidates: list[tuple[str, float, object]] = []
         reason = ""
-        best = None  # (score, text, confidence, frame): best read of this channel
-        # Capture retries (no frame), plus quality retries: when a keyframe still
-        # gives no digits, the wrong number of digits or a low confidence, we grab
-        # another keyframe and keep the best read. This is the "stable frame"
-        # selection: a single keyframe can be blurred or mid-fade on some cameras.
-        attempts = 1 + max(0, self.args.retries) + max(0, self.args.ocr_retries)
-        for _ in range(attempts):
+        # Capture retries (no frame at all) and quality retries (empty read or
+        # wrong digit count) are counted separately: a dead stream must not burn
+        # the OCR budget, and a bad read must not turn into a long capture loop.
+        capture_left = 1 + max(0, self.args.retries)
+        quality_left = max(0, self.args.ocr_retries)
+        while capture_left > 0:
+            capture_left -= 1
             body, data, url = self._start(code)
             try:
                 if not is_ok(body) or not url:
@@ -241,45 +352,80 @@ class Monitor:
                 target = (self.save_dir / safe_name(channel["index"], code)
                           if self.save_dir else
                           Path(tempfile.gettempdir()) / f"osd_{channel['index']}.jpg")
-                frame = grab_frame(self.ffmpeg, url, self.args.timeout,
-                                   target, keep=bool(self.save_dir))
+                frames = grab_frames(self.ffmpeg, url, self.args.timeout, target,
+                                     skip_frames=self.args.skip_frames,
+                                     count=self.args.frames,
+                                     keyframes=self.args.frame_source == "key")
             finally:
                 self._stop(code, data.get("session"))
-            if frame is None:
+            if not frames:
                 reason = "capture timeout"
                 continue
 
-            text, confidence = self.ocr(frame)
-            # prefer non-empty, then the digit count closest to the channel name,
-            # then the highest confidence
-            score = (bool(text),
-                     -abs(len(text) - target_len) if text else -99,
-                     confidence)
-            if best is None or score > best[0]:
-                best = (score, text, confidence, frame)
-            if text and (not target_len or
-                         (len(text) == target_len and confidence >= OCR_MIN_CONF)):
+            candidates = []
+            with self.ocr_lock:
+                for frame in frames:
+                    best = None
+                    for roi in self.roi_options(frame, code, expected):
+                        if roi.size == 0:
+                            continue
+                        try:
+                            text, conf, _source = read_number(
+                                self.reader, roi, expected_len, self.allowlist,
+                                numeric_expected=numeric,
+                                mag_ratio=self.args.mag_ratio)
+                        except Exception:  # one bad crop must not kill the channel
+                            continue
+                        if numeric:
+                            text = text.translate(DIGIT_CONFUSIONS)
+                        if best is None or conf > best[1]:
+                            best = (text, conf, frame)
+                        if self.is_good(text, expected):
+                            break
+                    if best is not None:
+                        candidates.append(best)
+
+            detected = majority([c[0] for c in candidates])
+            if detected and self.is_good(detected, expected):
                 break
             reason = "low quality OCR"
+            if quality_left > 0:
+                quality_left -= 1
+                capture_left += 1  # spend one more capture on reading quality
 
-        if best is None:
+        if not frames:
             result["status"] = f"CAPTURE_FAILED({reason})" if reason else "CAPTURE_FAILED"
             return result
 
-        _, detected, confidence, frame = best
+        # The OSD number is constant, so the most frequent reading wins.
+        detected = majority([c[0] for c in candidates])
+        matches = [c for c in candidates if detected and c[0] == detected]
+        confidence = max((c[1] for c in matches), default=0.0)
+        result["votes"] = [c[0] for c in candidates]
         result["detected"] = detected
         result["confidence"] = confidence
         if not detected:
             result["status"] = "NO_OCR"
-        elif not result["expected"]:
+        elif not expected:
             result["status"] = "NO_EXPECTED"
-        elif canonical(detected) == canonical(result["expected"]):
+        elif canonical(detected) == canonical(expected):
             result["status"] = "OK"
         else:
             result["status"] = "MISMATCH"
 
+        # Keep the frame that produced the winning reading (falls back to the
+        # first captured frame when nothing was read).
+        if matches:
+            best_frame = max(matches, key=lambda c: c[1])[2]
+        elif candidates:
+            best_frame = candidates[0][2]
+        else:
+            best_frame = frames[0]
+        if self.save_dir:
+            cv2.imwrite(str(self.save_dir / safe_name(channel["index"], code)),
+                        best_frame)
         if self.error_dir and result["status"] != "OK":
-            self.save_anomaly(channel, frame)
+            self.save_anomaly(channel, best_frame)
         return result
 
 
@@ -297,7 +443,8 @@ def main() -> None:
                         default=PROJECT_ROOT / "output" / "osd_rounds.csv")
     parser.add_argument("--save-dir", type=Path,
                         default=PROJECT_ROOT / "snapshots" / "osd20")
-    parser.add_argument("--no-save", action="store_true")
+    parser.add_argument("--no-save", action="store_true",
+                        help="do not keep frames of healthy channels")
     parser.add_argument("--error-dir", type=Path, default=None,
                         help="keep frames of abnormal channels here "
                              "(e.g. /work/snapshots/osd_error)")
@@ -311,14 +458,38 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--stream-type", choices=["1", "2"], default="1",
                         help="1=main stream (1080p), 2=sub stream")
+    parser.add_argument("--frames", type=int, default=None,
+                        help="frames per channel per round, majority-voted "
+                             "(default: 1 with --frame-source key, else 3)")
+    parser.add_argument("--frame-source", choices=["key", "all"], default="key",
+                        help="key: decode keyframes only (complete pictures, "
+                             "default); all: decode everything and skip "
+                             "--skip-frames frames")
+    parser.add_argument("--allowlist", choices=["digits", "alnum"],
+                        default="alnum",
+                        help="digits: 0-9 only; alnum: A-Z a-z 0-9 and dash")
+    parser.add_argument("--roi-mode",
+                        choices=["adaptive", "wide", "fixed", "auto", "bottom"],
+                        default="adaptive",
+                        help="adaptive: narrow for numeric labels, wide for "
+                             "alphanumeric; wide: (0,920)-(520,1080); "
+                             "fixed: (43,971)-(219,1040); auto: content-based "
+                             "detection; bottom: bottom-anchored box")
+    parser.add_argument("--roi", default="",
+                        help="fixed x1,y1,x2,y2; overrides --roi-mode")
+    parser.add_argument("--roi-file", default="",
+                        help="JSON map channelCode -> [x1,y1,x2,y2]")
     parser.add_argument("--retries", type=int, default=1,
                         help="retry a failed capture with a fresh token")
     parser.add_argument("--ocr-retries", type=int, default=1,
-                        help="grab another keyframe when the first read looks bad "
-                             "(no digits, wrong digit count, low confidence)")
-    parser.add_argument("--mag-ratio", type=float, default=2.0,
-                        help="EasyOCR mag_ratio applied to the OSD crop")
-    parser.add_argument("--timeout", type=float, default=15.0,
+                        help="grab another set of frames when the reading is "
+                             "empty or has the wrong length")
+    parser.add_argument("--skip-frames", type=int, default=10,
+                        help="only with --frame-source all: decode N frames "
+                             "before saving")
+    parser.add_argument("--mag-ratio", type=float, default=1.0,
+                        help="EasyOCR mag_ratio (image is already upscaled 3x)")
+    parser.add_argument("--timeout", type=float, default=20.0,
                         help="ffmpeg timeout per capture (seconds); a keyframe "
                              "may take a full GOP to arrive")
     parser.add_argument("--ffmpeg", default="",
@@ -327,6 +498,10 @@ def main() -> None:
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--verify-tls", action="store_true")
     args = parser.parse_args()
+    if args.frames is None:
+        args.frames = 1 if args.frame_source == "key" else 3
+    if args.frames < 1:
+        parser.error("--frames must be >= 1")
     if args.no_save:
         args.save_dir = None
     if not args.base:
@@ -347,7 +522,9 @@ def main() -> None:
 
     reader = easyocr.Reader(["en"], gpu=args.gpu, verbose=False)
     print(f"device: {reader.device}, channels: {len(channels)}, "
-          f"interval: {args.interval:g}s, stream: main", flush=True)
+          f"interval: {args.interval:g}s, stream: {args.stream_type}, "
+          f"frames: {args.frames} ({args.frame_source}), "
+          f"roi: {args.roi_mode}, chars: {args.allowlist}", flush=True)
 
     monitor = Monitor(p, reader, args)
     csv_path = args.csv
@@ -362,7 +539,6 @@ def main() -> None:
     while True:
         round_no += 1
         if rotate_seconds and time.monotonic() - output_since >= rotate_seconds:
-            args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text("", encoding="utf-8")
             output_since = time.monotonic()
             print(f"cleared {args.output} (every {args.output_rotate_hours:g}h)",

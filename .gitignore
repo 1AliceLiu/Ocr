@@ -3,9 +3,15 @@
 
 # Runtime outputs
 logs/
+output.txt
+output/
 
+# Data / generated media
 *.png
 *.jpg
-output/
 dataset/
 snapshots/
+
+# Python cache
+__pycache__/
+*.py[cod]

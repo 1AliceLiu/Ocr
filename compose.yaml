@@ -75,7 +75,8 @@ services:
       - "${MONITOR_INTERVAL:-60}"
     restart: unless-stopped
 
-  # Token-aware OSD monitor for the first 20 video channels (1080p main stream).
+  # Token-aware OSD monitor for every channel in out/streams.txt (1521 of them),
+  # 1080p main stream. --limit 0 would also mean "no limit".
   # Start/stop:  docker compose up -d osd20  /  docker compose stop osd20
   osd20:
     build: *easyocr-build
@@ -96,9 +97,20 @@ services:
       - /work/scripts/evo_osd_monitor.py
       - --gpu
       - --interval
-      - "${OSD_INTERVAL:-60}"
+      - "${OSD_INTERVAL:-3600}"
       - --limit
-      - "20"
+      - "1521"
+      - --workers
+      - "${OSD_WORKERS:-8}"
+      # healthy channels keep no frame; only anomalies are written to disk
+      - --no-save
+      - --error-dir
+      - /work/snapshots/osd_error
+      - --error-log
+      - /work/output/osd_error.txt
+      # output.txt is emptied every 3 hours
+      - --output-rotate-hours
+      - "${OSD_OUTPUT_ROTATE_HOURS:-3}"
     restart: unless-stopped
     deploy:
       resources:

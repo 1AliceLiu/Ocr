@@ -1,0 +1,41 @@
+# Development image for EasyOCR.
+# Source code is NOT baked into the final running container; `docker compose watch`
+# syncs the local working tree into /home/EasyOCR.
+#
+# CUDA 12.8 is required for RTX 50-series (Blackwell, sm_120) GPUs.
+FROM docker.io/pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/home/EasyOCR
+
+# System libraries needed by OpenCV / Pillow at runtime (same list as Dockerfile)
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgl1-mesa-dev \
+    git \
+    # cleanup
+    && apt-get autoremove -y \
+    && apt-get clean -y \
+    && rm -rf /var/lib/apt/lists
+
+WORKDIR /home/EasyOCR
+
+# Install dependencies first so editing the source does not invalidate this layer.
+# torch/torchvision already ship with the base image and satisfy requirements.txt.
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
+
+# Used by scripts/evo_pull.py (+ evo_osd_monitor.py): RSA login, and a bundled
+# ffmpeg binary for grabbing 1080p frames without installing the CLI.
+RUN pip install --no-cache-dir cryptography imageio-ffmpeg
+
+COPY . .
+RUN pip install -e .
+
+CMD ["sleep", "infinity"]

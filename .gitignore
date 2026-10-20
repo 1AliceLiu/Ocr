@@ -1,0 +1,10 @@
+# Local secrets: never commit (contains platform password and API key)
+.env
+
+# Runtime outputs
+logs/
+
+*.png
+output/
+dataset/
+snapshots/

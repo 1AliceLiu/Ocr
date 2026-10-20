@@ -1,0 +1,137 @@
+name: easyocr-dev
+
+x-easyocr-build: &easyocr-build
+  context: ./EasyOCR
+  dockerfile: Dockerfile.dev
+
+services:
+  easyocr:
+    build: *easyocr-build
+    image: easyocr-dev:latest
+    init: true
+    working_dir: /home/EasyOCR
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /home/EasyOCR
+      # Downloaded model weights are stored here (mounted as a named volume below).
+      EASYOCR_MODULE_PATH: /root/.EasyOCR
+
+    volumes:
+      # Keep downloaded models between container rebuilds (re-downloading them is slow).
+      - easyocr-models:/root/.EasyOCR
+      # Speed up pip installs on rebuild.
+      - pip-cache:/root/.cache/pip
+      # Whole project root: scripts, web-spider-label.txt, dataset, output.txt.
+      - ./:/work
+
+    # Keep the dev container alive; enter it with:
+    #   docker compose exec easyocr bash
+    command: ["sleep", "infinity"]
+
+    # NVIDIA GPU passthrough. Remove this block if you only have CPU available.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # `docker compose watch` behaviour.
+    develop:
+      watch:
+        # Local edits are copied into the running container (no restart needed).
+        - action: sync
+          path: ./EasyOCR
+          target: /home/EasyOCR
+          ignore:
+            - .git/
+            - .venv/
+            - "**/__pycache__/"
+            - "**/*.pyc"
+        # Dependency / image changes require a rebuild + restart.
+        - action: rebuild
+          path: ./EasyOCR/requirements.txt
+        - action: rebuild
+          path: ./EasyOCR/Dockerfile.dev
+
+  monitor:
+    build: *easyocr-build
+    image: easyocr-dev:latest
+    init: true
+    working_dir: /work
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EASYOCR_MODULE_PATH: /root/.EasyOCR
+      OPENCV_FFMPEG_LOGLEVEL: "quiet"
+    volumes:
+      - ./:/work
+      - easyocr-models:/root/.EasyOCR
+    command:
+      - python
+      - /work/scripts/rtsp_osd_monitor.py
+      - --interval
+      - "${MONITOR_INTERVAL:-60}"
+    restart: unless-stopped
+
+  # Token-aware OSD monitor for the first 20 video channels (1080p main stream).
+  # Start/stop:  docker compose up -d osd20  /  docker compose stop osd20
+  osd20:
+    build: *easyocr-build
+    image: easyocr-dev:latest
+    init: true
+    working_dir: /work
+    environment:
+      PYTHONUNBUFFERED: "1"
+      EASYOCR_MODULE_PATH: /root/.EasyOCR
+      EVO_BASE: ${EVO_BASE}
+      EVO_USER: ${EVO_USER}
+      EVO_PASSWORD: ${EVO_PASSWORD}
+    volumes:
+      - ./:/work
+      - easyocr-models:/root/.EasyOCR
+    command:
+      - python
+      - /work/scripts/evo_osd_monitor.py
+      - --gpu
+      - --interval
+      - "${OSD_INTERVAL:-60}"
+      - --limit
+      - "20"
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  api:
+    build:
+      context: ./api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      OUTPUT_FILE: /work/output.txt
+      API_KEY: ${API_KEY:-}
+      MONITOR_INTERVAL: ${MONITOR_INTERVAL:-60}
+    volumes:
+      - ./:/work:ro
+    restart: unless-stopped
+    depends_on:
+      - monitor
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  easyocr-models:
+  pip-cache:

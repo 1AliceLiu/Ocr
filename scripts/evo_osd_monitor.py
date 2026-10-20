@@ -23,6 +23,8 @@ Default behaviour:
 Anomaly handling (everything not OK = MISMATCH / NO_OCR / NO_EXPECTED / CAPTURE_FAILED):
   * `--error-log PATH`  appends the abnormal rows of each finished round to PATH
     (e.g. output/osd_error.txt), preceded by a `# round N <time>` marker.
+    `CAPTURE_FAILED(capture timeout)` rows are NOT written there: a timeout is a
+    stream/network problem, not an OSD anomaly (they stay in output.txt).
   * `--error-dir DIR`   keeps the full frame of each abnormal channel in DIR
     (e.g. snapshots/osd_error), one `<index>_<code>.jpg` per channel, overwritten
     every round. Channels that fail before a frame exists (CAPTURE_FAILED) have
@@ -92,6 +94,21 @@ def expected_code(name: str) -> str:
 
 def canonical(text: str) -> str:
     return DIGITS.sub("", text or "")
+
+
+def is_capture_timeout(status: str) -> bool:
+    """True for `CAPTURE_FAILED(capture timeout)`.
+
+    A timeout means the stream could not be opened/decoded in time (network,
+    platform load, camera offline), not that the OSD is wrong. Those rows stay in
+    output.txt but are kept out of osd_error.txt, so that file only lists
+    channels whose picture was actually inspected.
+    """
+    return status.startswith("CAPTURE_FAILED") and "capture timeout" in status
+
+
+def is_logged_anomaly(status: str) -> bool:
+    return status != "OK" and not is_capture_timeout(status)
 
 
 def crop_roi(frame):
@@ -358,6 +375,8 @@ def main() -> None:
         # buffering the whole round (1521 channels = minutes of silence).
         results: list[dict] = []
         ok = 0
+        logged = 0
+        timeouts = 0
         with contextlib.ExitStack() as stack:
             out = stack.enter_context(
                 args.output.open("a", encoding="utf-8", buffering=1))
@@ -396,7 +415,10 @@ def main() -> None:
                                      r["name"], r["expected"], r["detected"],
                                      f"{r['confidence']:.4f}", r["status"]])
                     csv_fh.flush()
-                    if err_fh and r["status"] != "OK":
+                    if is_capture_timeout(r["status"]):
+                        timeouts += 1
+                    elif err_fh and r["status"] != "OK":
+                        logged += 1
                         err_fh.write(f"{r['time']}\t{r['index']}\t{r['channelCode']}\t"
                                      f"{r['name']}\t{r['expected']}\t{r['detected']}\t"
                                      f"{r['confidence']:.3f}\t{r['status']}\n")
@@ -408,11 +430,12 @@ def main() -> None:
 
             if err_fh:
                 err_fh.write(f"# round {round_no} done: {ok}/{len(results)} OK, "
-                             f"{len(results) - ok} anomaly, "
+                             f"{logged} anomaly logged, "
+                             f"{timeouts} capture timeout skipped, "
                              f"{time.monotonic() - started:.1f}s\n")
 
-        print(f"round {round_no}: {ok}/{len(results)} OK, "
-              f"{len(results) - ok} anomaly, {time.monotonic() - started:.1f}s",
+        print(f"round {round_no}: {ok}/{len(results)} OK, {logged} anomaly, "
+              f"{timeouts} capture timeout, {time.monotonic() - started:.1f}s",
               flush=True)
 
         if args.once:

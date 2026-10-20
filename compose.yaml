@@ -97,7 +97,7 @@ services:
       - /work/scripts/evo_osd_monitor.py
       - --gpu
       - --interval
-      - "${OSD_INTERVAL:-3600}"
+      - "${OSD_INTERVAL:-600}"
       - --limit
       - "1521"
       - --workers

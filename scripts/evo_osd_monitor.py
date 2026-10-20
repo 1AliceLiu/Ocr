@@ -8,7 +8,10 @@ Default behaviour:
   * input  : out/streams.txt (first 20 channels)
   * stream : main stream (1920x1080 or larger), no resizing
   * frames : 3 consecutive frames per channel, OCR each, majority vote
-  * ROI    : bottom-left corner, (43, 971) - (219, 1040) in 1080p coordinates
+  * ROI    : adaptive by default: narrow (43,971)-(219,1040) for numeric
+             labels, wide (0,920)-(520,1080) for alphanumeric codes;
+             override with --roi or --roi-file
+  * chars  : alphanumeric by default (P40A2-087); --allowlist digits for 0-9
   * output : output.txt, one tab-separated line per channel per round:
              time  expected  detected  channelCode  channelName  confidence  status
   * extra  : output/osd_rounds.csv (same data with a header)
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import subprocess
@@ -47,14 +51,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evo_pull import START_VIDEO, STOP_VIDEO, Platform, is_ok, pick_rtsp  # noqa: E402
 from evo_snapshot import read_channels, safe_name  # noqa: E402
-from osd_ocr import majority, read_number  # noqa: E402
+from osd_ocr import (  # noqa: E402
+    ALLOW_ALNUM,
+    ALLOW_DIGITS,
+    detect_roi,
+    majority,
+    read_number,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Bottom-left OSD ROI for a 1920x1080 frame: (x1, y1, x2, y2).
 X1, Y1, X2, Y2 = 43, 971, 219, 1040
 BEIJING_TZ = timezone(timedelta(hours=8))
-DIGITS = re.compile(r"\D")
+NON_ALNUM = re.compile(r"[^0-9A-Za-z]")
+WIDE_ROI = (0, 920, 520, 1080)
+FIXED_ROI = (X1, Y1, X2, Y2)
+# Common digit/letter confusions on the OSD font; applied only when the
+# expected channel code is numeric.
+DIGIT_CONFUSIONS = str.maketrans({"O": "0", "o": "0", "I": "1",
+                                  "i": "1", "l": "1", "|": "1"})
 
 
 def now_beijing() -> datetime:
@@ -62,19 +78,25 @@ def now_beijing() -> datetime:
 
 
 def expected_code(name: str) -> str:
-    match = re.search(r"\d+", name or "")
-    return match.group(0) if match else ""
+    """'P40A2-087_1' -> 'P40A2-087'; '2544_1' -> '2544'."""
+    stem = re.sub(r"_\d+$", "", name or "")
+    if "-" in stem and re.search(r"[A-Za-z]", stem):
+        return stem
+    match = re.search(r"\d+", stem)
+    return match.group(0) if match else stem
 
 
 def canonical(text: str) -> str:
-    return DIGITS.sub("", text or "")
+    """Compare codes ignoring case, spaces and separators (keeps letters)."""
+    return NON_ALNUM.sub("", text or "").upper()
 
 
-def crop_roi(frame):
-    height, width = frame.shape[:2]
-    if width < X2 or height < Y2:
-        raise ValueError(f"frame too small for ROI: {width}x{height}")
-    return frame[Y1:Y2, X1:X2]
+def parse_roi(text: str) -> tuple[int, int, int, int]:
+    try:
+        x1, y1, x2, y2 = (int(part) for part in text.split(","))
+    except ValueError as exc:
+        raise SystemExit("--roi must be x1,y1,x2,y2") from exc
+    return x1, y1, x2, y2
 
 
 def grab_frames(ffmpeg: str, url: str, timeout: float, target: Path,
@@ -131,6 +153,44 @@ class Monitor:
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
         self.ffmpeg = args.ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
+        self.allowlist = (ALLOW_ALNUM if args.allowlist == "alnum"
+                          else ALLOW_DIGITS)
+        self.roi = parse_roi(args.roi) if args.roi else None
+        self.roi_map = {}
+        if args.roi_file:
+            with Path(args.roi_file).open(encoding="utf-8") as handle:
+                self.roi_map = json.load(handle)
+
+    def roi_options(self, frame, channel_code: str, expected: str):
+        """ROIs to try, best first. Adaptive = narrow for numeric labels."""
+        custom = (self.roi_map.get(channel_code)
+                  or self.roi_map.get("*"))
+        if custom:
+            x1, y1, x2, y2 = custom
+            return [frame[y1:y2, x1:x2]]
+        if self.roi:
+            x1, y1, x2, y2 = self.roi
+            return [frame[y1:y2, x1:x2]]
+
+        mode = self.args.roi_mode
+        if mode == "auto":
+            return [detect_roi(frame)]
+        if mode == "fixed":
+            boxes = [FIXED_ROI]
+        elif mode == "wide":
+            boxes = [WIDE_ROI]
+        else:  # adaptive
+            boxes = ([FIXED_ROI, WIDE_ROI] if expected.isdigit()
+                     else [WIDE_ROI, FIXED_ROI])
+        return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
+
+    @staticmethod
+    def is_good(text: str, expected: str) -> bool:
+        if not text:
+            return False
+        if expected.isdigit():
+            return text.isdigit() and len(text) == len(expected)
+        return any(ch.isalpha() for ch in text)
 
     def _start(self, code: str):
         with self.api_lock:
@@ -191,13 +251,25 @@ class Monitor:
             result["status"] = f"CAPTURE_FAILED({reason})" if reason else "CAPTURE_FAILED"
             return result
 
-        expected_len = len(result["expected"]) or None
+        expected = result["expected"]
+        expected_len = len(expected) or None
+        numeric = expected.isdigit()
         candidates = []
         with self.ocr_lock:
             for frame in frames:
-                text, conf, _src = read_number(
-                    self.reader, crop_roi(frame), expected_len)
-                candidates.append((text, conf, frame))
+                best = None
+                for roi in self.roi_options(frame, code, expected):
+                    text, conf, _src = read_number(
+                        self.reader, roi, expected_len, self.allowlist,
+                        numeric_expected=numeric)
+                    if numeric:
+                        text = text.translate(DIGIT_CONFUSIONS)
+                    if best is None or conf > best[1]:
+                        best = (text, conf, frame)
+                    if self.is_good(text, expected):
+                        break
+                if best is not None:
+                    candidates.append(best)
 
         # The OSD number is constant, so the most frequent reading wins.
         detected = majority([c[0] for c in candidates])
@@ -258,6 +330,19 @@ def main() -> None:
                         help="1=main stream (1080p), 2=sub stream")
     parser.add_argument("--frames", type=int, default=3,
                         help="frames per channel per round, majority-voted")
+    parser.add_argument("--allowlist", choices=["digits", "alnum"],
+                        default="alnum",
+                        help="digits: 0-9 only; alnum: A-Z a-z 0-9 and dash")
+    parser.add_argument("--roi-mode",
+                        choices=["adaptive", "wide", "fixed", "auto"],
+                        default="adaptive",
+                        help="adaptive: narrow for numeric labels, wide for "
+                             "alphanumeric; wide: (0,920)-(520,1080); "
+                             "fixed: (43,971)-(219,1040)")
+    parser.add_argument("--roi", default="",
+                        help="fixed x1,y1,x2,y2; overrides --roi-mode")
+    parser.add_argument("--roi-file", default="",
+                        help="JSON map channelCode -> [x1,y1,x2,y2]")
     parser.add_argument("--retries", type=int, default=1,
                         help="retry a failed capture with a fresh token")
     parser.add_argument("--skip-frames", type=int, default=10,

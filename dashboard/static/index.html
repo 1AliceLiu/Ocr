@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>OSD 检测结果</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='42' font-family='Arial,sans-serif' font-size='24' font-weight='700' text-anchor='middle' fill='white'%3EOSD%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="page-glow" aria-hidden="true"></div>
+
+  <div class="page">
+    <header class="hero">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">OSD</div>
+        <div class="brand-text">
+          <h1>OSD 检测结果</h1>
+          <p>output/osd_error.txt · 仅显示异常通道 · 北京时间</p>
+        </div>
+      </div>
+
+      <div class="hero-status">
+        <span class="status-dot" id="statusDot" aria-hidden="true"></span>
+        <span id="statusText">正在读取</span>
+        <span class="status-separator" aria-hidden="true">·</span>
+        <span id="updatedAt">—</span>
+      </div>
+    </header>
+
+    <section class="panel toolbar" aria-label="查询条件">
+      <div class="control">
+        <label for="dateInput">检测日期</label>
+        <div class="control-row">
+          <div class="input-shell date-shell">
+            <span class="input-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <rect x="3.5" y="5" width="17" height="15.5" rx="3"></rect>
+                <path d="M8 3.5v3M16 3.5v3M3.5 10h17"></path>
+              </svg>
+            </span>
+            <input type="date" id="dateInput">
+          </div>
+          <button type="button" class="btn ghost" id="todayBtn">今天</button>
+        </div>
+        <p class="hint" id="dateHint">—</p>
+      </div>
+
+      <div class="control search-control" id="searchControl">
+        <label for="searchInput">通道编码</label>
+        <div class="control-row">
+          <div class="input-shell search-shell">
+            <span class="input-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+                <circle cx="10.5" cy="10.5" r="6.5"></circle>
+                <path d="M15.5 15.5 21 21"></path>
+              </svg>
+            </span>
+            <input type="search" id="searchInput" autocomplete="off" spellcheck="false"
+                   placeholder="搜索当天结果，例如 1002484$1$0$0">
+          </div>
+          <button type="button" class="btn primary" id="searchBtn">搜索</button>
+          <button type="button" class="btn ghost" id="clearSearchBtn" disabled>清除</button>
+        </div>
+        <p class="hint" id="searchHint">仅支持搜索当天结果</p>
+      </div>
+
+      <div class="control refresh-control">
+        <button type="button" class="btn refresh-btn" id="refreshBtn" title="重新读取数据">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20 11a8 8 0 1 0-2.4 6.1"></path>
+            <path d="M20 5.5V11h-5.5"></path>
+          </svg>
+          <span>刷新</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="panel chart-panel hidden" id="chartPanel" aria-labelledby="chartTitle">
+      <div class="chart-head">
+        <div class="chart-heading">
+          <h2 id="chartTitle">今日设备名称 Top 50</h2>
+          <p class="chart-subtitle" id="chartSubtitle">正在统计 MISMATCH 通道…</p>
+        </div>
+        <div class="chart-tools">
+          <div class="segmented" id="chartModeSwitch" role="group" aria-label="柱状图横轴">
+            <button type="button" data-chart-mode="device" class="active">设备名称</button>
+            <button type="button" data-chart-mode="channel">通道编码</button>
+          </div>
+          <button type="button" class="btn ghost chart-open-btn" id="chartOpenBtn">点击放大</button>
+        </div>
+      </div>
+      <button type="button" class="chart-thumb" id="chartThumb"
+              aria-label="点击放大串流设备柱状图">
+        <div class="chart-small" id="chartSmall"></div>
+        <span class="chart-thumb-hint">点击查看大图</span>
+      </button>
+    </section>
+
+    <section class="stats" aria-label="统计信息">
+      <article class="stat-card">
+        <span class="stat-label">异常记录</span>
+        <strong class="stat-value" id="statTotal">—</strong>
+        <span class="stat-foot" id="statTotalFoot">当天</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">检测轮次</span>
+        <strong class="stat-value" id="statRounds">—</strong>
+        <span class="stat-foot" id="statRoundsFoot">含异常记录</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">当前筛选</span>
+        <strong class="stat-value stat-text" id="statFilter">全部通道</strong>
+        <span class="stat-foot" id="statFilterFoot">未启用搜索</span>
+      </article>
+      <article class="stat-card">
+        <span class="stat-label">数据来源</span>
+        <strong class="stat-value stat-text" id="statSource">—</strong>
+        <span class="stat-foot" id="statSourceFoot">—</span>
+      </article>
+    </section>
+
+    <div class="notice hidden" id="notice" role="status"></div>
+
+    <main class="results" id="results" aria-live="polite">
+      <div class="loading-card">
+        <span class="spinner" aria-hidden="true"></span>
+        <span>正在加载检测结果…</span>
+      </div>
+    </main>
+
+    <footer class="panel pagination" id="pagination">
+      <div class="page-summary" id="pageSummary">—</div>
+      <nav class="pager" id="pager" aria-label="分页"></nav>
+      <label class="page-size" for="pageSizeSelect">
+        每页
+        <select id="pageSizeSelect">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+        </select>
+        条
+      </label>
+    </footer>
+
+    <p class="footer-note">只读展示 · 历史数据来自 Logs 归档 · 本页面不会修改 osd20 检测任务</p>
+  </div>
+
+  <div class="chart-modal hidden" id="chartModal" role="dialog" aria-modal="true"
+       aria-labelledby="chartModalTitle">
+    <div class="chart-modal-backdrop" data-chart-close></div>
+    <div class="chart-modal-card">
+      <header class="chart-modal-head">
+        <div class="chart-heading">
+          <h2 id="chartModalTitle">发生通道统计</h2>
+          <p class="chart-subtitle" id="chartModalSubtitle">—</p>
+        </div>
+        <div class="chart-modal-actions">
+          <div class="zoom-controls" aria-label="图表缩放">
+            <button type="button" id="chartZoomOut" aria-label="缩小">−</button>
+            <span id="chartZoomLabel">100%</span>
+            <button type="button" id="chartZoomIn" aria-label="放大">+</button>
+            <button type="button" id="chartZoomReset">重置</button>
+          </div>
+          <button type="button" class="chart-modal-close" id="chartClose"
+                  aria-label="关闭大图">×</button>
+        </div>
+      </header>
+      <div class="chart-modal-scroll" id="chartModalScroll">
+        <div class="chart-modal-canvas" id="chartModalCanvas"></div>
+      </div>
+      <p class="chart-modal-foot">
+        拖动滚动条查看 · Ctrl/⌘ + 滚轮缩放 · 双指捏合缩放 · Esc 关闭
+      </p>
+    </div>
+  </div>
+
+  <div class="image-modal hidden" id="imageModal" role="dialog" aria-modal="true"
+       aria-labelledby="imageModalTitle">
+    <div class="image-modal-backdrop" data-image-close></div>
+    <div class="image-modal-card">
+      <header class="image-modal-head">
+        <div class="chart-heading">
+          <h2 id="imageModalTitle">抓帧图片</h2>
+          <p class="chart-subtitle" id="imageModalSubtitle">—</p>
+        </div>
+        <div class="chart-modal-actions">
+          <div class="zoom-controls" aria-label="图片缩放">
+            <button type="button" id="imageZoomOut" aria-label="缩小">−</button>
+            <span id="imageZoomLabel">100%</span>
+            <button type="button" id="imageZoomIn" aria-label="放大">+</button>
+            <button type="button" id="imageZoomReset">重置</button>
+          </div>
+          <button type="button" class="chart-modal-close" id="imageClose"
+                  aria-label="关闭图片">×</button>
+        </div>
+      </header>
+      <div class="image-modal-scroll" id="imageModalScroll">
+        <img class="image-preview" id="imagePreview" alt="通道抓帧图片">
+        <div class="image-error hidden" id="imageError">图片加载失败或已不存在</div>
+      </div>
+      <p class="chart-modal-foot">
+        拖动滚动条查看 · Ctrl/⌘ + 滚轮缩放 · 双指捏合缩放 · Esc 关闭
+      </p>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

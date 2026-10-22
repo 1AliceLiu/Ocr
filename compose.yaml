@@ -97,17 +97,27 @@ services:
       - /work/scripts/evo_osd_monitor.py
       - --gpu
       - --interval
-      - "${OSD_INTERVAL:-600}"
+      - "${OSD_INTERVAL:-3600}"
       - --limit
       - "1521"
       - --workers
       - "${OSD_WORKERS:-8}"
+      - --frames
+      - "${OSD_FRAMES:-3}"
       # healthy channels keep no frame; only anomalies are written to disk
       - --no-save
       - --error-dir
       - /work/snapshots/osd_error
       - --error-log
       - /work/output/osd_error.txt
+      # per-channel ROI/type profile; missing file is OK (safe defaults)
+      - --osd-profile-file
+      - /work/config/osd_profiles.json
+      # numeric channels: row projection + per-cell solid mask + EasyOCR
+      - --cell-reader
+      - cells
+      - --cell-decoder
+      - beamsearch
       # output.txt is emptied every 3 hours
       - --output-rotate-hours
       - "${OSD_OUTPUT_ROTATE_HOURS:-3}"
@@ -119,6 +129,140 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # 每天跨天时删除 output/osd_error.txt 里前一天的记录（只保留当天）。
+  # 删除前会把旧记录归档到 Logs/YYYYMMDD_osd_error.csv。
+  # 日志：docker compose logs -f osd-error-prune
+  # 手动执行一次：docker compose exec osd-error-prune \
+  #               python /work/scripts/prune_osd_error.py --once --dry-run
+  osd-error-prune:
+    build: *easyocr-build
+    image: easyocr-dev:latest
+    init: true
+    working_dir: /work
+    volumes:
+      - ./:/work
+    command:
+      - python
+      - /work/scripts/prune_osd_error.py
+      - --watch
+      - --image-dir
+      - /work/snapshots/osd_error
+    restart: unless-stopped
+
+  # 每天北京时间 09:00 重新拉取 out/streams.txt，然后重启 osd20 让新列表生效。
+  # 需要挂载 /var/run/docker.sock（用来重启 osd20），详见 docs/osd_daily_refresh.md
+  osd-daily:
+    build: *easyocr-build
+    image: easyocr-dev:latest
+    init: true
+    working_dir: /work
+    environment:
+      EVO_BASE: ${EVO_BASE}
+      EVO_USER: ${EVO_USER}
+      EVO_PASSWORD: ${EVO_PASSWORD}
+    volumes:
+      - ./:/work
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      - python
+      - /work/scripts/daily_refresh.py
+      - --watch
+      - --time
+      - "${REFRESH_TIME:-09:00}"
+    restart: unless-stopped
+
+  # 只读结果看板（demo）：首页展示 output/osd_error.txt，支持按日期查归档、
+  # 按轮次分隔、按通道编码搜索当天结果、底部分页。
+  # 启动/更新：docker compose up -d --build osd-dashboard
+  # 内网地址：http://<服务器IP>:8011 （可用 DASHBOARD_PORT 覆盖，免密）
+  # 该服务只读挂载项目目录，不修改 osd20 的代码或运行状态。
+  osd-dashboard:
+    image: easyocr-dev-osd-dashboard:latest
+    build:
+      context: ./dashboard
+    ports:
+      - "${DASHBOARD_PORT:-8011}:8000"
+    environment:
+      OSD_ERROR_FILE: /work/output/osd_error.txt
+      OSD_ROUNDS_FILE: /work/output/osd_rounds.csv
+      CHANNELS_FILE: /work/out/channels.csv
+      ERROR_IMAGE_DIR: /work/snapshots/osd_error
+      ARCHIVE_DIR: /work/Logs
+      HISTORY_ROUNDS: "1"
+      DASHBOARD_PAGE_SIZE: "50"
+      STREAM_TOP_N: "50"
+      # 内网实例刻意不启用登录；公网访问请走 osd-dashboard-public。
+      DASHBOARD_USER: ""
+      DASHBOARD_PASSWORD: ""
+    volumes:
+      - ./:/work:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 公网专用看板实例：与内网实例同一个镜像/数据源，但启用登录。
+  # 只绑定宿主机回环 127.0.0.1:8012，供 Tailscale Funnel / Cloudflare Tunnel
+  # 转发，不会暴露到局域网或公网。
+  osd-dashboard-public:
+    image: easyocr-dev-osd-dashboard:latest
+    build:
+      context: ./dashboard
+    # 只绑定宿主机回环地址，供 Tailscale Funnel / Cloudflare Tunnel 使用；
+    # 不会暴露到局域网或公网。
+    ports:
+      - "127.0.0.1:${DASHBOARD_PUBLIC_PORT:-8012}:8000"
+    environment:
+      OSD_ERROR_FILE: /work/output/osd_error.txt
+      OSD_ROUNDS_FILE: /work/output/osd_rounds.csv
+      CHANNELS_FILE: /work/out/channels.csv
+      ERROR_IMAGE_DIR: /work/snapshots/osd_error
+      ARCHIVE_DIR: /work/Logs
+      HISTORY_ROUNDS: "1"
+      DASHBOARD_PAGE_SIZE: "50"
+      STREAM_TOP_N: "50"
+      DASHBOARD_USER: ${DASHBOARD_USER:-osd}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      DASHBOARD_SESSION_HOURS: "12"
+    volumes:
+      - ./:/work:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 可选：给外网同事临时看页面用的 Cloudflare Quick Tunnel。
+  # 不需要公网 IP / 路由器端口映射 / 域名；启动后会生成一个
+  # https://xxxx.trycloudflare.com 地址，容器重启后地址会变化。
+  # 启动：docker compose up -d osd-dashboard-public osd-dashboard-tunnel
+  # 查看地址：docker compose logs osd-dashboard-tunnel | grep trycloudflare
+  osd-dashboard-tunnel:
+    image: cloudflare/cloudflared:latest
+    # 不随 `docker compose up -d` 自动暴露到公网；需要时显式启动本服务。
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    depends_on:
+      - osd-dashboard-public
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --protocol
+      - http2
+      - --url
+      - http://osd-dashboard-public:8000
 
   api:
     build:

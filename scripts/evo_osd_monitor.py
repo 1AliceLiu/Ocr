@@ -10,30 +10,54 @@ immediately.
 Default behaviour:
   * input  : out/streams.txt (all channels)
   * stream : main stream (1920x1080 or larger), no resizing
-  * frames : keyframes only (`-skip_frame nokey`), 1 per channel by default;
-             `--frames N` majority-votes N keyframes (slower: one GOP each)
-  * ROI    : adaptive by default: narrow (43,971)-(219,1040) for numeric
-             labels, wide (0,920)-(520,1080) for alphanumeric codes; the boxes
-             are scaled to the real frame height; override with --roi/--roi-file
+  * frames : keyframes only (`-skip_frame nokey`), 3 per channel by default,
+             majority-voted (each keyframe costs one GOP -> slower, steadier)
+  * ROI    : numeric channels use a per-channel profile ROI (default bottom-left
+             320x100 at 1080p), row projection finds the OSD line, and cells are
+             split by column projection.  `--cell-reader legacy` restores the
+             old content-based ROI/whole-line path.  `--roi` / `--roi-file`
+             still override the profile.
   * chars  : alphanumeric by default (P40A2-087); --allowlist digits for 0-9
+             Chinese labels (traditional 繁體 and simplified 简体) are read by a
+             fallback model when the latin read is empty; --cjk off disables it
+  * cells  : for numeric channels, each cell keeps the whole white glyph fill,
+             is inverted to solid black on white, and is read with EasyOCR
+             `recognize()`; a low-confidence/segment failure falls back to the
+             legacy whole-line reader.
+  * vote   : every reading (3 frames x ROIs x 2 preprocessing variants) is one
+             vote; for numeric codes only readings with the expected digit count
+             vote, so '72436' cannot outvote the real '2436'
+  * decoder: --decoder greedy (default) | beamsearch (slower, steadier);
+             --cell-decoder defaults to beamsearch for per-cell reads
   * output : output.txt, one tab-separated line per channel per round:
              time  expected  detected  channelCode  channelName  confidence  status
              `--output-rotate-hours N` empties output.txt every N hours.
   * extra  : output/osd_rounds.csv (same data with a header)
              snapshots/osd20/<index>_<code>.jpg (latest frame, overwritten)
 
-Anomaly handling (everything not OK = MISMATCH / NO_OCR / NO_EXPECTED / CAPTURE_FAILED):
+Anomaly handling (OSD verdicts: OK / MISMATCH / UNCERTAIN / NO_OSD; capture
+failures are separate):
   * `--error-log PATH`  appends the abnormal rows of each round to PATH
     (e.g. output/osd_error.txt), preceded by a `# round N <time>` marker.
     `CAPTURE_FAILED(capture timeout)` rows are NOT written there: a timeout is a
     stream/network problem, not an OSD anomaly (they stay in output.txt).
   * `--error-dir DIR`   keeps the full frame of each abnormal channel in DIR
-    (e.g. snapshots/osd_error), one `<index>_<code>.jpg` per channel, overwritten
-    every round. Channels that fail before a frame exists (CAPTURE_FAILED) have
-    no image, only a log line.
+    (e.g. snapshots/osd_error), one `<index>_<code>.jpg` per channel, inside a
+    per-round folder `round_<N>_<YYYYMMDD_HHMMSS>`. Frames are therefore kept
+    for every round instead of being overwritten. Channels that fail before a
+    frame exists (CAPTURE_FAILED) have no image, only a log line.
   * `--no-save`         do not keep frames of healthy channels anywhere.
 
-Status values: OK, MISMATCH, NO_OCR, NO_EXPECTED, CAPTURE_FAILED.
+OSD status values: OK, MISMATCH, UNCERTAIN, NO_OSD.
+`CAPTURE_FAILED(...)` is a capture failure, not an OSD verdict.
+Crossover is reported as MISMATCH, with `crossover=True` / `reason=CROSSOVER`.
+
+Matching rule for OK: both the channel code and the scan are reduced to their
+LAST contiguous digit group (letters/separators ignored), so 'MB_ZM_DO_CE_0679'
+-> '0679' and 'P4042-032' -> '032'. Alphanumeric codes need the same number;
+numeric codes also match when the scanned number contains them contiguously;
+a leading 0 is optional. e.g. '0679' matches '679'/'X-0679'; '2436' matches
+'12436', not '436'.
 
 Run it inside the easyocr container (it has cv2 + easyocr):
 
@@ -76,8 +100,14 @@ from osd_ocr import (  # noqa: E402
     read_number,
     scale_box,
 )
+from osd_digits import (  # noqa: E402
+    default_profile,
+    load_profiles,
+    read_digits,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PROFILE_PATH = PROJECT_ROOT / "config" / "osd_profiles.json"
 
 # Bottom-left OSD ROI for a 1920x1080 frame: (x1, y1, x2, y2).
 X1, Y1, X2, Y2 = 43, 971, 219, 1040
@@ -95,6 +125,8 @@ ROI_BASE_WIDTH = 760
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 NON_ALNUM = re.compile(r"[^0-9A-Za-z]")
+# CJK ideographs: the OSD label is sometimes Chinese (traditional or simplified).
+CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 # Common digit/letter confusions on the OSD font; applied only when the
 # expected channel code is numeric.
 DIGIT_CONFUSIONS = str.maketrans({"O": "0", "o": "0", "I": "1",
@@ -106,8 +138,13 @@ def now_beijing() -> datetime:
 
 
 def expected_code(name: str) -> str:
-    """'P40A2-087_1' -> 'P40A2-087'; '2544_1' -> '2544'."""
-    stem = re.sub(r"_\d+$", "", name or "")
+    """'P40A2-087_1' -> 'P40A2-087'; '2544_1' -> '2544'; 'MB_ZM_DO_CE_0673' -> '0673'."""
+    name = name or ""
+    stem = re.sub(r"_\d+$", "", name)
+    # Keep the trailing number when the stem has no digits left: the last part
+    # of 'MB_ZM_DO_CE_0673' *is* the code, not a sequence suffix.
+    if not re.search(r"\d", stem):
+        stem = name
     if "-" in stem and re.search(r"[A-Za-z]", stem):
         return stem
     match = re.search(r"\d+", stem)
@@ -119,27 +156,61 @@ def canonical(text: str) -> str:
     return NON_ALNUM.sub("", text or "").upper()
 
 
+def has_cjk(text: str) -> bool:
+    return bool(CJK.search(text or ""))
+
+
+DIGITS_RUN = re.compile(r"\d+")
+
+
+def digits_of(text: str) -> str:
+    return "".join(DIGITS_RUN.findall(text or ""))
+
+
+def tail_digits(text: str) -> str:
+    """Last contiguous digit group: 'P4042-032' -> '032'."""
+    runs = DIGITS_RUN.findall(text or "")
+    return runs[-1] if runs else ""
+
+
+def numbers_match(expected: str, detected: str) -> bool:
+    """Compare a channel code with the scanned OSD label by their numbers.
+
+    Both sides are reduced to their LAST contiguous digit group, letters and
+    separators are ignored:
+
+        MB_ZM_DO_CE_0679  -> 0679
+        P4042-032         -> 032
+
+    * code with letters and digits: the two trailing numbers must be the same
+      ('0679' matches '0679', 'X-0679'; it does not match '032').
+    * code with digits only: the scanned number may carry extra digits around
+      it, as long as all the code digits appear contiguously ('2436' matches
+      '12436' and '24361', not '436').
+    * a leading 0 is optional on both sides, so '0679' and '679' are the same
+      code ("有0无0都算对").
+    """
+    code = tail_digits(expected)
+    scanned = tail_digits(detected)
+    if not code or not scanned:
+        return False
+
+    def same(a: str, b: str) -> bool:
+        return a == b or (a.lstrip("0") or a) == (b.lstrip("0") or b)
+
+    if same(code, scanned):
+        return True
+    if re.search(r"[A-Za-z]", expected or ""):
+        return False
+    # pure numeric code: allow extra digits around it in the scan
+    return code in scanned or (code.lstrip("0") or code) in scanned.lstrip("0")
+
+
 def parse_roi(text: str) -> tuple[int, int, int, int]:
     try:
         x1, y1, x2, y2 = (int(part) for part in text.split(","))
     except ValueError as exc:
         raise SystemExit("--roi must be x1,y1,x2,y2") from exc
-    return x1, y1, x2, y2
-
-
-def scale_box(box: tuple[int, int, int, int], width: int,
-              height: int) -> tuple[int, int, int, int]:
-    """Scale a 1080p reference box to the real frame, with a little margin.
-
-    Some 4MP/5MP cameras draw the OSD a few pixels further left than a strict
-    h/1080 scaling predicts, so the left/top edges are padded.
-    """
-    factor = height / 1080.0
-    x1, y1, x2, y2 = box
-    x1 = max(0, int(x1 * factor) - 20)
-    y1 = max(0, int(y1 * factor) - 10)
-    x2 = min(width, int(x2 * factor))
-    y2 = min(height, int(y2 * factor))
     return x1, y1, x2, y2
 
 
@@ -157,7 +228,9 @@ def crop_roi(frame):
 def roi_base(frame):
     """Bottom-left band searched by the content-based ROI detector."""
     height, width = frame.shape[:2]
-    return (0, max(0, height - ROI_BASE_HEIGHT), min(width, ROI_BASE_WIDTH), height)
+    scale = height / 1080.0
+    return (0, max(0, height - round(ROI_BASE_HEIGHT * scale)),
+            min(width, round(ROI_BASE_WIDTH * scale)), height)
 
 
 def is_capture_timeout(status: str) -> bool:
@@ -172,7 +245,15 @@ def is_capture_timeout(status: str) -> bool:
 
 
 def is_logged_anomaly(status: str) -> bool:
-    return status != "OK" and not is_capture_timeout(status)
+    """Rows that should reach osd_error.txt.
+
+    UNCERTAIN is intentionally kept out of the error log: it means the picture
+    was not readable enough to make a claim.  It still appears in output.txt and
+    osd_rounds.csv for diagnostics.
+    """
+    return (status != "OK"
+            and not is_capture_timeout(status)
+            and not status.startswith("UNCERTAIN"))
 
 
 def grab_frames(ffmpeg: str, url: str, timeout: float, target: Path,
@@ -236,11 +317,12 @@ class Monitor:
         self.api_lock = threading.Lock()
         self.ocr_lock = threading.Lock()
         self.save_dir = args.save_dir
-        self.error_dir = args.error_dir
+        self.error_root = args.error_dir
+        self.error_dir = None
         if self.save_dir:
             self.save_dir.mkdir(parents=True, exist_ok=True)
-        if self.error_dir:
-            self.error_dir.mkdir(parents=True, exist_ok=True)
+        if self.error_root:
+            self.error_root.mkdir(parents=True, exist_ok=True)
         self.ffmpeg = args.ffmpeg or imageio_ffmpeg.get_ffmpeg_exe()
         self.allowlist = (ALLOW_ALNUM if args.allowlist == "alnum"
                           else ALLOW_DIGITS)
@@ -249,6 +331,24 @@ class Monitor:
         if args.roi_file:
             with Path(args.roi_file).open(encoding="utf-8") as handle:
                 self.roi_map = json.load(handle)
+
+        self.profile_data = load_profiles(args.osd_profile_file)
+        self.profiles = self.profile_data.get("channels", {})
+        self.profile_defaults = self.profile_data.get("defaults", {})
+        self.expected_codes: set[str] = set()
+        # Chinese fallback models. EasyOCR cannot mix ch_sim and ch_tra in one
+        # model ("Chinese_tra is only compatible with English"), so there is one
+        # reader per script; both are only used when the latin read is empty.
+        self.cjk_readers = []
+        for lang, wanted in (("ch_sim", args.cjk in ("sim", "both")),
+                             ("ch_tra", args.cjk in ("tra", "both"))):
+            if not wanted:
+                continue
+            try:
+                self.cjk_readers.append(
+                    easyocr.Reader([lang, "en"], gpu=args.gpu, verbose=False))
+            except Exception as exc:  # missing model / download failure
+                print(f"  warn: cannot load {lang} OCR model: {exc}", flush=True)
 
     def roi_options(self, frame, channel_code: str, expected: str):
         """ROIs to try, best first. Adaptive = narrow for numeric labels."""
@@ -265,7 +365,19 @@ class Monitor:
 
         mode = self.args.roi_mode
         if mode == "auto":
-            return [detect_roi(frame, base=roi_base(frame))]
+            # Tight crop around the detected text; the wide box still gets a
+            # vote in case the detector picked the wrong blob.
+            rois = []
+            try:
+                tight = detect_roi(frame, base=roi_base(frame))
+            except Exception:
+                tight = None
+            if (tight is not None and tight.size
+                    and tight.shape[0] >= 10 and tight.shape[1] >= 20):
+                rois.append(tight)
+            wide = scale_box(WIDE_ROI, width, height)
+            rois.append(frame[wide[1]:wide[3], wide[0]:wide[2]])
+            return rois
         if mode == "bottom":
             return [crop_roi(frame)]
         if mode == "fixed":
@@ -273,21 +385,104 @@ class Monitor:
         elif mode == "wide":
             boxes = [scale_box(WIDE_ROI, width, height)]
         else:  # adaptive
-            boxes = ([FIXED_ROI, WIDE_ROI] if expected.isdigit()
-                     else [WIDE_ROI, FIXED_ROI])
+            narrow = scale_box(FIXED_ROI, width, height)
+            wide = scale_box(WIDE_ROI, width, height)
+            boxes = ([narrow, wide] if expected.isdigit() else [wide, narrow])
         return [frame[y1:y2, x1:x2] for x1, y1, x2, y2 in boxes]
+
+    def profile_for(self, channel: dict, expected: str) -> dict:
+        """Per-channel OSD profile, with safe defaults when no JSON exists."""
+        code = channel["channelCode"]
+        profile = self.profiles.get(code)
+        if not profile:
+            profile = default_profile(channel.get("name", ""), expected,
+                                      self.profile_defaults)
+        else:
+            profile = dict(profile)
+            base = default_profile(channel.get("name", ""), expected,
+                                   self.profile_defaults)
+            base.update(profile)
+            profile = base
+
+        # CLI overrides win over the profile file, matching the old --roi /
+        # --roi-file behaviour.
+        if self.roi:
+            profile["roi"] = list(self.roi)
+        custom = self.roi_map.get(code) or self.roi_map.get("*")
+        if custom:
+            profile["roi"] = list(custom)
+
+        if not profile.get("roi"):
+            profile["roi"] = list(default_profile(
+                channel.get("name", ""), expected)["roi"])
+        if expected.isdigit():
+            profile.setdefault("type", "digits")
+            profile.setdefault("length", len(expected))
+        else:
+            profile.setdefault("type", "alnum")
+        profile["expected"] = expected
+        return profile
 
     @staticmethod
     def is_good(text: str, expected: str) -> bool:
         if not text:
             return False
+        if has_cjk(text):
+            # A Chinese label is a valid reading; do not burn recaptures on it.
+            return True
         if expected.isdigit():
-            return text.isdigit() and len(text) == len(expected)
+            return (text.isdigit()
+                    and (len(text) == len(expected)
+                         or numbers_match(expected, text)))
         return any(ch.isalpha() for ch in text)
+
+    def read_cjk(self, frame, channel_code: str, expected: str, best):
+        """Fallback for OSD labels that are Chinese (traditional/simplified).
+
+        The primary English model only knows latin characters and digits, so a
+        Chinese label comes back empty or as latin garbage. Keep the best of the
+        existing read and the ch_sim/ch_tra readings, ranked by:
+          1. contains the expected code (so '2438-全景' still matches '2438')
+          2. contains CJK at all (a Chinese label is the whole point)
+          3. OCR confidence
+        """
+        wanted = canonical(expected)
+        candidates = [best] if best else []
+        for reader in self.cjk_readers:
+            for roi in self.roi_options(frame, channel_code, expected):
+                if roi.size == 0:
+                    continue
+                try:
+                    text, conf, _source = read_number(
+                        reader, roi, None, None, numeric_expected=False,
+                        mag_ratio=self.args.mag_ratio,
+                        decoder=self.args.decoder)
+                except Exception:
+                    continue
+                if text:
+                    candidates.append((text, conf, frame))
+        if not candidates:
+            return best
+
+        def rank(candidate):
+            text, conf, _frame = candidate
+            return (bool(wanted) and wanted in canonical(text),
+                    has_cjk(text), conf)
+
+        return max(candidates, key=rank)
+
+    def start_round(self, round_no: int, round_time: str) -> None:
+        """Create a per-round folder so anomaly frames are not overwritten."""
+        if not self.error_root:
+            self.error_dir = None
+            return
+        stamp = round_time.replace("-", "").replace(":", "").replace(" ", "_")
+        self.error_dir = self.error_root / f"round_{round_no:04d}_{stamp}"
+        self.error_dir.mkdir(parents=True, exist_ok=True)
 
     def save_anomaly(self, channel: dict, frame) -> None:
         """Keep the full frame of a channel whose status is not OK."""
-        if frame is None:
+        if frame is None or not self.error_dir:
             return
         path = self.error_dir / safe_name(channel["index"], channel["channelCode"])
         try:
@@ -319,6 +514,64 @@ class Monitor:
                 "optModule": "ADMIN_001031",
             }})
 
+    def _read_legacy_frame(self, frame, code: str, channel_name: str,
+                           expected: str, expected_len: int | None, numeric: bool,
+                           extra_rois=None):
+        """One frame through the old whole-line EasyOCR path.
+
+        Returns (best, votes); best is (text, confidence, frame).
+        """
+        best = None
+        votes: list[str] = []
+        rois = list(extra_rois or []) + self.roi_options(frame, code, expected)
+        for roi in rois:
+            if roi.size == 0:
+                continue
+            try:
+                text, conf, _source, variant_votes = read_number(
+                    self.reader, roi, expected_len, self.allowlist,
+                    numeric_expected=numeric,
+                    mag_ratio=self.args.mag_ratio,
+                    decoder=self.args.decoder,
+                    return_votes=True)
+            except Exception:  # one bad crop must not kill the channel
+                continue
+            if numeric:
+                text = text.translate(DIGIT_CONFUSIONS)
+                variant_votes = [v.translate(DIGIT_CONFUSIONS)
+                                 for v in variant_votes]
+            votes.extend(variant_votes)
+            if best is None or conf > best[1]:
+                best = (text, conf, frame)
+
+        # Chinese-only labels read as latin garbage ("TT") or empty with the
+        # latin model; a Chinese channel name is the other strong hint.
+        latin_text = best[0] if best else ""
+        if (self.cjk_readers and
+                (has_cjk(channel_name) or
+                 not any(ch.isdigit() for ch in latin_text))):
+            best = self.read_cjk(frame, code, expected, best)
+        return best, votes
+
+    @staticmethod
+    def matches_expected(detected: str, expected: str) -> bool:
+        if not detected or not expected:
+            return False
+        return (canonical(detected) == canonical(expected)
+                or numbers_match(expected, detected))
+
+    def is_other_expected(self, detected: str, expected: str) -> bool:
+        """True when `detected` matches a different channel's expected code."""
+        if not detected:
+            return False
+        det_canon = canonical(detected)
+        for code in self.expected_codes:
+            if not code or code == expected:
+                continue
+            if canonical(code) == det_canon or numbers_match(code, detected):
+                return True
+        return False
+
     def one(self, channel: dict) -> dict:
         code = channel["channelCode"]
         result = {
@@ -332,8 +585,14 @@ class Monitor:
             "time": now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
         }
         expected = result["expected"]
-        expected_len = len(expected) or None
+        profile = self.profile_for(channel, expected)
+        expected_len = profile.get("length") or len(expected) or None
         numeric = expected.isdigit()
+        cell_mode = (self.args.cell_reader == "cells"
+                     and profile.get("type") == "digits"
+                     and numeric)
+        cell_meta: dict = {}
+        legacy_used = False
 
         frames: list = []
         candidates: list[tuple[str, float, object]] = []
@@ -364,29 +623,104 @@ class Monitor:
                 continue
 
             candidates = []
+            votes: list[str] = []
+            cell_meta = {}
+            legacy_used = False
             with self.ocr_lock:
                 for frame in frames:
                     best = None
-                    for roi in self.roi_options(frame, code, expected):
-                        if roi.size == 0:
-                            continue
-                        try:
-                            text, conf, _source = read_number(
-                                self.reader, roi, expected_len, self.allowlist,
-                                numeric_expected=numeric,
-                                mag_ratio=self.args.mag_ratio)
-                        except Exception:  # one bad crop must not kill the channel
-                            continue
-                        if numeric:
-                            text = text.translate(DIGIT_CONFUSIONS)
-                        if best is None or conf > best[1]:
-                            best = (text, conf, frame)
-                        if self.is_good(text, expected):
-                            break
+                    if cell_mode:
+                        cell_result = read_digits(
+                            self.reader, frame, profile,
+                            decoder=self.args.cell_decoder)
+                        cell_text = cell_result.get("text", "")
+                        cell_conf = float(cell_result.get("confidence", 0.0))
+                        # Keep the best cell result across frames; a later bad
+                        # frame must not turn a good read into UNCERTAIN.
+                        if (not cell_meta
+                                or (cell_text
+                                    and cell_conf >= float(cell_meta.get(
+                                        "confidence", 0.0)))):
+                            cell_meta = cell_result
+                        cell_matches = self.matches_expected(cell_text, expected)
+                        cell_extra = (
+                            bool(cell_result.get("extra_glyphs"))
+                            and bool(cell_text) and cell_text.isdigit())
+                        plausible = (
+                            bool(cell_text)
+                            and cell_text.isdigit()
+                            and (cell_matches or cell_extra
+                                 or (expected_len is not None
+                                     and len(cell_text) == expected_len
+                                     and cell_conf >= self.args.cell_min_conf)))
+
+                        # A second, independent opinion is the legacy whole-line
+                        # reader, not the raw/core/solid variants: those variants
+                        # all feed the same EasyOCR recognition model and often
+                        # share the same 5->6 bias.  Run legacy when the cell
+                        # read does not match expected, or when it is implausible.
+                        need_legacy = (not plausible) or (bool(cell_text)
+                                                          and not cell_matches)
+                        if not need_legacy:
+                            votes.append(cell_text)
+                            best = (cell_text, cell_conf, frame)
+                        else:
+                            extra = []
+                            profile_roi = profile.get("roi")
+                            if profile_roi:
+                                px1, py1, px2, py2 = scale_box(
+                                    tuple(profile_roi), frame.shape[1], frame.shape[0])
+                                extra.append(frame[py1:py2, px1:px2])
+                            legacy_best, legacy_votes = self._read_legacy_frame(
+                                frame, code, channel["name"], expected,
+                                expected_len, numeric, extra_rois=extra)
+                            if legacy_votes:
+                                legacy_used = True
+                            legacy_matches = (
+                                legacy_best is not None
+                                and self.matches_expected(legacy_best[0], expected))
+                            high_conf_legacy = (
+                                legacy_matches
+                                and legacy_best[1] >= 0.9
+                                and (not plausible
+                                     or legacy_best[1] >= cell_conf + 0.1))
+                            if high_conf_legacy:
+                                # Prefer the high-confidence independent reader
+                                # that actually matches expected.  Do not count
+                                # the low-confidence cell vote in this case.
+                                votes.extend(legacy_votes)
+                                best = legacy_best
+                            else:
+                                if plausible:
+                                    votes.append(cell_text)
+                                    best = (cell_text, cell_conf, frame)
+                                votes.extend(legacy_votes)
+                                if (legacy_best is not None
+                                        and (best is None
+                                             or legacy_best[1] > best[1])):
+                                    best = legacy_best
+                    else:
+                        best, legacy_votes = self._read_legacy_frame(
+                            frame, code, channel["name"], expected,
+                            expected_len, numeric)
+                        votes.extend(legacy_votes)
+
                     if best is not None:
                         candidates.append(best)
 
-            detected = majority([c[0] for c in candidates])
+            # Pure numeric codes: only readings with the expected digit count
+            # vote ('72436' / '43' must not outvote the real '2436').
+            pool = votes
+            if numeric and expected_len:
+                exact = [v for v in votes
+                         if v.isdigit() and len(v) == expected_len]
+                if exact:
+                    pool = exact
+            detected = majority(pool) or majority([c[0] for c in candidates])
+            if not has_cjk(detected):
+                cjk_reads = [c for c in candidates if has_cjk(c[0])]
+                if cjk_reads:
+                    detected = max(cjk_reads, key=lambda c: c[1])[0]
             if detected and self.is_good(detected, expected):
                 break
             reason = "low quality OCR"
@@ -398,21 +732,59 @@ class Monitor:
             result["status"] = f"CAPTURE_FAILED({reason})" if reason else "CAPTURE_FAILED"
             return result
 
-        # The OSD number is constant, so the most frequent reading wins.
-        detected = majority([c[0] for c in candidates])
+        # detected comes from the variant vote pool computed above; keep it.
         matches = [c for c in candidates if detected and c[0] == detected]
-        confidence = max((c[1] for c in matches), default=0.0)
+        confidence = max((c[1] for c in matches),
+                         default=max((c[1] for c in candidates), default=0.0))
         result["votes"] = [c[0] for c in candidates]
         result["detected"] = detected
         result["confidence"] = confidence
-        if not detected:
-            result["status"] = "NO_OCR"
-        elif not expected:
-            result["status"] = "NO_EXPECTED"
-        elif canonical(detected) == canonical(expected):
+        result["reader"] = ("cells+legacy" if cell_mode and legacy_used
+                            else "cells" if cell_mode else "legacy")
+        result["segment_reason"] = cell_meta.get("reason", "") if cell_mode else ""
+        result["cell_texts"] = cell_meta.get("cell_texts", []) if cell_mode else []
+        result["roi"] = cell_meta.get("roi") if cell_mode else None
+        result["extra_glyphs"] = bool(cell_meta.get("extra_glyphs"))
+        cell_reason = result["segment_reason"]
+        cell_ok = (
+            cell_mode
+            and cell_reason in ("OK", "BOX_FALLBACK")
+            and bool(detected)
+            and detected.isdigit()
+            and expected_len is not None
+            and len(detected) == expected_len
+        ) or (
+            cell_mode
+            and bool(result["extra_glyphs"])
+            and bool(detected)
+            and detected.isdigit()
+        )
+
+        result["crossover"] = False
+        result["reason"] = ""
+        if not expected:
+            result["status"] = "UNCERTAIN(NO_EXPECTED)"
+        elif not detected:
+            if cell_mode and cell_reason in ("NO_MASK", "NO_BAND", "NO_GROUP",
+                                             "EMPTY_ROI"):
+                result["status"] = "NO_OSD"
+            elif cell_mode and cell_reason.startswith("CELL_COUNT"):
+                result["status"] = f"UNCERTAIN({cell_reason})"
+            else:
+                result["status"] = "UNCERTAIN(NO_OCR)"
+        elif (canonical(detected) == canonical(expected)
+              or numbers_match(expected, detected)):
             result["status"] = "OK"
         else:
-            result["status"] = "MISMATCH"
+            # Crossover is still MISMATCH.  Keep the flag only for diagnostics
+            # and operator context; it is not a separate status label.
+            if self.is_other_expected(detected, expected):
+                result["crossover"] = True
+                result["reason"] = "CROSSOVER"
+            if cell_mode and not cell_ok and not legacy_used:
+                result["status"] = f"UNCERTAIN({cell_reason or 'LOW_CONF'})"
+            else:
+                result["status"] = "MISMATCH"
 
         # Keep the frame that produced the winning reading (falls back to the
         # first captured frame when nothing was read).
@@ -447,8 +819,9 @@ def main() -> None:
     parser.add_argument("--no-save", action="store_true",
                         help="do not keep frames of healthy channels")
     parser.add_argument("--error-dir", type=Path, default=None,
-                        help="keep frames of abnormal channels here "
-                             "(e.g. /work/snapshots/osd_error)")
+                        help="keep frames of abnormal channels here, one "
+                             "subfolder per round (e.g. "
+                             "/work/snapshots/osd_error)")
     parser.add_argument("--error-log", type=Path, default=None,
                         help="append abnormal channels of each round to this "
                              "file (e.g. /work/output/osd_error.txt)")
@@ -459,9 +832,9 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--stream-type", choices=["1", "2"], default="1",
                         help="1=main stream (1080p), 2=sub stream")
-    parser.add_argument("--frames", type=int, default=None,
+    parser.add_argument("--frames", type=int, default=3,
                         help="frames per channel per round, majority-voted "
-                             "(default: 1 with --frame-source key, else 3)")
+                             "(each keyframe costs one GOP)")
     parser.add_argument("--frame-source", choices=["key", "all"], default="key",
                         help="key: decode keyframes only (complete pictures, "
                              "default); all: decode everything and skip "
@@ -469,17 +842,38 @@ def main() -> None:
     parser.add_argument("--allowlist", choices=["digits", "alnum"],
                         default="alnum",
                         help="digits: 0-9 only; alnum: A-Z a-z 0-9 and dash")
+    parser.add_argument("--cjk", choices=["off", "sim", "tra", "both"],
+                        default="both",
+                        help="also try Chinese OCR (ch_sim/ch_tra) when the "
+                             "latin read is empty; both = traditional and "
+                             "simplified (two models, EasyOCR cannot mix them)")
     parser.add_argument("--roi-mode",
-                        choices=["adaptive", "wide", "fixed", "auto", "bottom"],
-                        default="adaptive",
-                        help="adaptive: narrow for numeric labels, wide for "
-                             "alphanumeric; wide: (0,920)-(520,1080); "
-                             "fixed: (43,971)-(219,1040); auto: content-based "
-                             "detection; bottom: bottom-anchored box")
+                        choices=["auto", "adaptive", "wide", "fixed", "bottom"],
+                        default="auto",
+                        help="auto: tight crop around the detected text (plus a "
+                             "wide-box vote); adaptive: narrow for numeric "
+                             "labels, wide for alphanumeric; wide: "
+                             "(0,920)-(520,1080); fixed: (43,971)-(219,1040); "
+                             "bottom: bottom-anchored box")
     parser.add_argument("--roi", default="",
                         help="fixed x1,y1,x2,y2; overrides --roi-mode")
     parser.add_argument("--roi-file", default="",
                         help="JSON map channelCode -> [x1,y1,x2,y2]")
+    parser.add_argument("--osd-profile-file", default=str(DEFAULT_PROFILE_PATH),
+                        help="optional per-channel OSD profile JSON "
+                             "(roi/type/length/alias); missing file is OK")
+    parser.add_argument("--cell-reader", choices=["cells", "legacy"],
+                        default="cells",
+                        help="cells: row projection + per-cell solid mask + "
+                             "EasyOCR recognize for numeric channels; legacy: "
+                             "old whole-line readtext path")
+    parser.add_argument("--cell-decoder", choices=["greedy", "beamsearch"],
+                        default="beamsearch",
+                        help="EasyOCR decoder for per-cell recognition "
+                             "(default: beamsearch)")
+    parser.add_argument("--cell-min-conf", type=float, default=0.7,
+                        help="minimum per-cell OCR confidence before falling "
+                             "back to the legacy whole-line reader")
     parser.add_argument("--retries", type=int, default=1,
                         help="retry a failed capture with a fresh token")
     parser.add_argument("--ocr-retries", type=int, default=1,
@@ -490,17 +884,19 @@ def main() -> None:
                              "before saving")
     parser.add_argument("--mag-ratio", type=float, default=1.0,
                         help="EasyOCR mag_ratio (image is already upscaled 3x)")
-    parser.add_argument("--timeout", type=float, default=20.0,
-                        help="ffmpeg timeout per capture (seconds); a keyframe "
-                             "may take a full GOP to arrive")
+    parser.add_argument("--decoder", choices=["greedy", "beamsearch"],
+                        default="greedy",
+                        help="EasyOCR decoder; beamsearch is slower but usually "
+                             "more accurate on thin/hollow OSD fonts")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="ffmpeg timeout per capture (seconds); every "
+                             "keyframe may take a full GOP to arrive")
     parser.add_argument("--ffmpeg", default="",
                         help="override ffmpeg binary (default: imageio-ffmpeg)")
     parser.add_argument("--gpu", action="store_true", help="EasyOCR on GPU")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--verify-tls", action="store_true")
     args = parser.parse_args()
-    if args.frames is None:
-        args.frames = 1 if args.frame_source == "key" else 3
     if args.frames < 1:
         parser.error("--frames must be >= 1")
     if args.no_save:
@@ -525,9 +921,12 @@ def main() -> None:
     print(f"device: {reader.device}, channels: {len(channels)}, "
           f"interval: {args.interval:g}s, stream: {args.stream_type}, "
           f"frames: {args.frames} ({args.frame_source}), "
-          f"roi: {args.roi_mode}, chars: {args.allowlist}", flush=True)
+          f"roi: {args.roi_mode}, chars: {args.allowlist}, cjk: {args.cjk}, "
+          f"reader: {args.cell_reader}/{args.cell_decoder}, "
+          f"profiles: {args.osd_profile_file}", flush=True)
 
     monitor = Monitor(p, reader, args)
+    monitor.expected_codes = {expected_code(ch["name"]) for ch in channels}
     csv_path = args.csv
     csv_started = csv_path.exists() and csv_path.stat().st_size > 0
     for path in (args.output, csv_path, args.error_log):
@@ -546,6 +945,7 @@ def main() -> None:
                   flush=True)
         started = time.monotonic()
         round_time = now_beijing().strftime("%Y-%m-%d %H:%M:%S")
+        monitor.start_round(round_no, round_time)
         print(f"--- round {round_no} ({now_beijing():%H:%M:%S}) ---", flush=True)
 
         # Stream every result to disk as soon as its channel is done, instead of
@@ -554,6 +954,7 @@ def main() -> None:
         ok = 0
         logged = 0
         timeouts = 0
+        uncertain = 0
         with contextlib.ExitStack() as stack:
             out = stack.enter_context(
                 args.output.open("a", encoding="utf-8", buffering=1))
@@ -594,26 +995,33 @@ def main() -> None:
                     csv_fh.flush()
                     if is_capture_timeout(r["status"]):
                         timeouts += 1
-                    elif err_fh and r["status"] != "OK":
+                    elif r["status"].startswith("UNCERTAIN"):
+                        uncertain += 1
+                    elif err_fh and is_logged_anomaly(r["status"]):
                         logged += 1
+                        # Keep osd_error.txt at the original 8-column schema:
+                        # time index channelCode name expected detected confidence status
                         err_fh.write(f"{r['time']}\t{r['index']}\t{r['channelCode']}\t"
                                      f"{r['name']}\t{r['expected']}\t{r['detected']}\t"
                                      f"{r['confidence']:.3f}\t{r['status']}\n")
                     if r["status"] == "OK":
                         ok += 1
+                    extra = f" reason={r['reason']}" if r.get("reason") else ""
                     print(f"  {r['index']:>3} {r['name']:<12} expected={r['expected']!r} "
                           f"detected={r['detected']!r} conf={r['confidence']:.2f} "
-                          f"{r['status']}", flush=True)
+                          f"{r['status']}{extra}", flush=True)
 
             if err_fh:
                 err_fh.write(f"# round {round_no} done: {ok}/{len(results)} OK, "
                              f"{logged} anomaly logged, "
                              f"{timeouts} capture timeout skipped, "
                              f"{time.monotonic() - started:.1f}s\n")
+                if uncertain:
+                    err_fh.write(f"# round {round_no} uncertain: {uncertain}\n")
 
         print(f"round {round_no}: {ok}/{len(results)} OK, {logged} anomaly, "
-              f"{timeouts} capture timeout, {time.monotonic() - started:.1f}s",
-              flush=True)
+              f"{timeouts} capture timeout, {uncertain} uncertain, "
+              f"{time.monotonic() - started:.1f}s", flush=True)
 
         if args.once:
             break

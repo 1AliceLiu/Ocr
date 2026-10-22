@@ -24,6 +24,7 @@ import easyocr
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evo_osd_monitor import FIXED_ROI, WIDE_ROI  # noqa: E402
+from osd_digits import default_profile, read_digits  # noqa: E402
 from osd_ocr import (  # noqa: E402
     ALLOW_ALNUM,
     ALLOW_DIGITS,
@@ -42,6 +43,9 @@ def main() -> None:
     parser.add_argument("--allowlist", choices=["digits", "alnum"],
                         default="alnum")
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--cell", action="store_true",
+                        help="use the row-projection/per-cell pipeline instead "
+                             "of the legacy whole-line reader")
     parser.add_argument("--save-crop", default="",
                         help="write the best ROI crop to this path")
     args = parser.parse_args()
@@ -50,6 +54,23 @@ def main() -> None:
     if image is None:
         raise SystemExit(f"cannot read {args.image}")
     print(f"image: {image.shape[1]}x{image.shape[0]}")
+
+    if args.cell:
+        reader = easyocr.Reader(["en"], gpu=args.gpu, verbose=False)
+        # The expected string only supplies type/length here; the digits are
+        # not used as a prior for recognition.
+        expected = "0" * max(1, args.expected_len)
+        profile = default_profile("", expected)
+        if args.roi:
+            profile["roi"] = [int(v) for v in args.roi.split(",")]
+        result = read_digits(reader, image, profile, decoder="beamsearch")
+        print(f"cells  {result['text']!r:<12} "
+              f"conf={result['confidence']:.3f} "
+              f"reason={result['reason']} cells={result['cell_texts']}")
+        if args.save_crop and result.get("line") is not None:
+            cv2.imwrite(args.save_crop, result["line"])
+            print(f"crop: {args.save_crop}")
+        return
 
     if args.roi:
         x1, y1, x2, y2 = (int(v) for v in args.roi.split(","))

@@ -3,6 +3,7 @@
 
 # Runtime outputs
 logs/
+Logs/
 output.txt
 output/
 
@@ -15,3 +16,12 @@ snapshots/
 # Python cache
 __pycache__/
 *.py[cod]
+
+# Temporary visualisation output
+temp/
+
+# All csv files
+*.csv
+# All txt files
+*.txt
+

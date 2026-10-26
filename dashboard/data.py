@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import bisect
 import csv
+import io
 import os
 import re
 import threading
@@ -22,6 +23,8 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+import confirmations as confirmation_store
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +45,7 @@ HISTORY_ROUNDS = os.getenv("HISTORY_ROUNDS", "1").strip().lower() not in (
 DEFAULT_PAGE_SIZE = int(os.getenv("DASHBOARD_PAGE_SIZE", "50"))
 MAX_PAGE_SIZE = int(os.getenv("DASHBOARD_MAX_PAGE_SIZE", "200"))
 STREAM_TOP_N = max(3, int(os.getenv("STREAM_TOP_N", "50")))
+CONFIRM_RESULTS = {"confirmed", "false_positive"}
 
 ROUND_HEADER_RE = re.compile(
     r"^#\s*round\s+(\d+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
@@ -580,6 +584,497 @@ def _load_round_spans() -> list[dict[str, Any]]:
     return spans
 
 
+def _parse_ts(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _row_id(row: dict[str, Any]) -> str:
+    index = row.get("index")
+    return f"{row.get('time', '')}|{'' if index is None else index}|{row.get('channelCode', '')}"
+
+
+def _span_index_for_time(
+    spans: list[dict[str, Any]], starts: list[str], time_text: str,
+) -> int | None:
+    position = bisect.bisect_right(starts, time_text) - 1
+    if position < 0:
+        return None
+    if time_text > spans[position]["end"]:
+        if (position + 1 < len(spans)
+                and spans[position + 1]["start"] <= time_text):
+            position += 1
+        else:
+            return None
+    return position
+
+
+def _auto_confirm_rows(
+    date: str,
+    groups: list[dict[str, Any]],
+    confirmations: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Confirm the next round when the same channel was confirmed last round.
+
+    Only the immediately previous round counts.  The previous confirmation may
+    be manual or auto, so a confirmed stream keeps propagating through
+    consecutive MISMATCH rounds until the chain breaks.
+    """
+    spans = _load_round_spans()
+    if not spans:
+        return confirmations
+    starts = [span["start"] for span in spans]
+    previous_date = (
+        datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    records = list(confirmations.values()) + confirmation_store.list_for_date(previous_date)
+    confirmed_index: dict[tuple[str, int], dict[str, Any]] = {}
+    for record in records:
+        if record.get("result") != "confirmed":
+            continue
+        position = _span_index_for_time(spans, starts, record.get("time", ""))
+        if position is None:
+            continue
+        confirmed_index[(record["channel_code"], position)] = record
+
+    rows: list[dict[str, Any]] = []
+    for group in groups:
+        for row in group["rows"]:
+            if (row.get("status") or "").upper().startswith("MISMATCH"):
+                rows.append(row)
+    rows.sort(key=lambda row: (row["time"], row["index"] or 0))
+
+    now = now_beijing().strftime("%Y-%m-%d %H:%M:%S")
+    for row in rows:
+        key = _row_id(row)
+        existing = confirmations.get(key)
+        if existing is not None and existing.get("result") is not None:
+            continue
+        position = _span_index_for_time(spans, starts, row["time"])
+        if position is None or position == 0:
+            continue
+        channel_code = row.get("channelCode") or ""
+        if (channel_code, position - 1) not in confirmed_index:
+            continue
+        record = confirmation_store.save(
+            row_key=key,
+            confirm_date=date,
+            time=row["time"],
+            channel_code=channel_code,
+            channel_name=row.get("name") or "",
+            result="confirmed",
+            note="",
+            confirmed_at=now,
+            actor="system",
+            source="auto",
+        )
+        if record is None:
+            continue
+        confirmation_store.log_event(
+            row_key=key,
+            action="auto-confirm",
+            result="confirmed",
+            note="",
+            at=now,
+            confirm_date=date,
+            channel_code=channel_code,
+            actor="system",
+            source="auto",
+        )
+        confirmations[key] = record
+        confirmed_index[(channel_code, position)] = record
+    return confirmations
+
+
+def _done_windows() -> list[tuple[datetime, datetime]]:
+    windows: list[tuple[datetime, datetime]] = []
+    for block in _load_live_blocks():
+        done = block.get("done") or {}
+        start = _parse_ts(block.get("startedAt"))
+        duration = done.get("durationSeconds")
+        if start is None or duration is None:
+            continue
+        windows.append((start, start + timedelta(seconds=float(duration))))
+    return windows
+
+
+def _span_has_done(span: dict[str, Any],
+                   windows: list[tuple[datetime, datetime]]) -> bool:
+    start = _parse_ts(span.get("start"))
+    end = _parse_ts(span.get("end"))
+    if start is None or end is None:
+        return False
+    for window_start, window_end in windows:
+        if (abs((start - window_start).total_seconds()) <= 300
+                and abs((end - window_end).total_seconds()) <= 300):
+            return True
+    return False
+
+
+def _report_ready(date: str) -> tuple[bool, str]:
+    today = today_str()
+    if date > today:
+        return False, "不能查询未来日期"
+    if date == today:
+        return False, "当天所有轮次尚未结束，日报将在最后一轮完成后生成"
+    spans = _load_round_spans()
+    date_spans = [span for span in spans if span["start"][:10] == date]
+    if not date_spans:
+        return False, "该日期没有轮次数据"
+    last = date_spans[-1]
+    if any(span["start"] > last["start"] for span in spans):
+        return True, ""
+    if last["end"][:10] <= date:
+        return True, ""
+    if _span_has_done(last, _done_windows()):
+        return True, ""
+    return False, "该日期最后一轮尚未结束"
+
+
+def _stop_restart(
+    events: list[dict[str, Any]],
+    spans: list[dict[str, Any]],
+    date: str,
+) -> list[dict[str, Any]]:
+    """Three complete rounds without a confirmed stream = stopped.
+
+    A later confirmed stream in the day is a restart.  If the last stream is
+    followed by three rounds on that date, it is a stop with no restart.
+    """
+    if not events or not spans:
+        return []
+    starts = [span["start"] for span in spans]
+    by_span: dict[int, list[str]] = {}
+    for event in events:
+        position = bisect.bisect_right(starts, event["time"]) - 1
+        if position < 0:
+            continue
+        if (event["time"] > spans[position]["end"]
+                and position + 1 < len(spans)
+                and spans[position + 1]["start"] <= event["time"]):
+            position += 1
+        by_span.setdefault(position, []).append(event["time"])
+
+    sequence = sorted(by_span)
+    result: list[dict[str, Any]] = []
+    for left, right in zip(sequence, sequence[1:]):
+        missing = right - left - 1
+        if missing >= 3:
+            result.append({
+                "stoppedAt": max(by_span[left]),
+                "restartedAt": min(by_span[right]),
+            })
+    if sequence:
+        last_position = sequence[-1]
+        tail = [
+            index for index, span in enumerate(spans)
+            if index > last_position and span["start"][:10] == date
+        ]
+        if len(tail) >= 3:
+            result.append({
+                "stoppedAt": max(by_span[last_position]),
+                "restartedAt": None,
+            })
+    return result
+
+
+def _detected_by_row(groups: list[dict[str, Any]]) -> dict[str, str]:
+    detected: dict[str, str] = {}
+    for group in groups:
+        for row in group["rows"]:
+            value = (row.get("detected") or "").strip()
+            if value:
+                detected[_row_id(row)] = value
+    return detected
+
+
+def _value_rows(counter: Counter[str]) -> list[dict[str, Any]]:
+    return [
+        {"detected": value, "count": count}
+        for value, count in sorted(
+            counter.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def _value_text(values: list[dict[str, Any]]) -> str:
+    if not values:
+        return "—"
+    return "、".join(
+        f"{item['detected']}（{item['count']} 次）" for item in values)
+
+
+def build_daily_report(date: str) -> dict[str, Any]:
+    """Build the completed-day report and its TXT representation."""
+    ready, reason = _report_ready(date)
+    today = today_str()
+    if date == today:
+        groups, _meta = _live_groups(date)
+    else:
+        groups, _meta = _history_groups(date)
+    confirmations = {
+        row["row_key"]: row
+        for row in confirmation_store.list_for_date(date)
+    }
+    _auto_confirm_rows(date, groups, confirmations)
+    records = confirmation_store.list_for_date(date)
+    confirmed = [row for row in records if row.get("result") == "confirmed"]
+    false_positive = [
+        row for row in records if row.get("result") == "false_positive"]
+    checked = len(confirmed) + len(false_positive)
+    accuracy = (len(confirmed) / checked * 100.0) if checked else None
+
+    previous_date = (
+        datetime.strptime(date, "%Y-%m-%d") - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+    if previous_date == today:
+        previous_groups, _previous_meta = _live_groups(previous_date)
+    else:
+        previous_groups, _previous_meta = _history_groups(previous_date)
+    previous_confirmations = {
+        row["row_key"]: row
+        for row in confirmation_store.list_for_date(previous_date)
+    }
+    _auto_confirm_rows(previous_date, previous_groups, previous_confirmations)
+    previous = [
+        row for row in confirmation_store.list_for_date(previous_date)
+        if row.get("result") == "confirmed"
+    ]
+
+    today_detected = _detected_by_row(groups)
+    previous_detected = _detected_by_row(previous_groups)
+    today_counts = Counter(
+        (row["channel_code"], row["channel_name"]) for row in confirmed)
+    previous_counts = Counter(
+        (row["channel_code"], row["channel_name"]) for row in previous)
+    today_values: dict[tuple[str, str], Counter[str]] = {}
+    previous_values: dict[tuple[str, str], Counter[str]] = {}
+    for row in confirmed:
+        pair = (row["channel_code"], row["channel_name"])
+        value = today_detected.get(row["row_key"], "")
+        if value:
+            today_values.setdefault(pair, Counter())[value] += 1
+    for row in previous:
+        pair = (row["channel_code"], row["channel_name"])
+        value = previous_detected.get(row["row_key"], "")
+        if value:
+            previous_values.setdefault(pair, Counter())[value] += 1
+
+    events_by_channel: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in confirmed:
+        events_by_channel.setdefault(
+            (row["channel_code"], row["channel_name"]), []).append(row)
+
+    spans = _load_round_spans()
+    channels: list[dict[str, Any]] = []
+    pairs = set(today_counts) | set(previous_counts)
+    for code, name in sorted(
+            pairs, key=lambda pair: (-today_counts[pair], pair[0], pair[1])):
+        pair = (code, name)
+        today_count = today_counts[pair]
+        previous_count = previous_counts[pair]
+        today_value_rows = _value_rows(today_values.get(pair, Counter()))
+        previous_value_rows = _value_rows(previous_values.get(pair, Counter()))
+        same_values = sorted(
+            {item["detected"] for item in today_value_rows}
+            & {item["detected"] for item in previous_value_rows}
+        )
+        events = sorted(
+            events_by_channel.get(pair, []),
+            key=lambda row: row["time"],
+        )
+        channels.append({
+            "channelCode": code,
+            "channelName": name,
+            "today": today_count,
+            "previous": previous_count,
+            "change": today_count - previous_count,
+            "todayValues": today_value_rows,
+            "previousValues": previous_value_rows,
+            "sameValues": same_values,
+            "stops": _stop_restart(events, spans, date),
+        })
+
+    lines = [f"{date} 串流日报", f"生成时间：{now_beijing():%Y-%m-%d %H:%M:%S}", ""]
+    lines.append(f"已确认记录：{checked} 条")
+    lines.append(f"确认真实串流：{len(confirmed)} 条")
+    lines.append(f"确认误报：{len(false_positive)} 条")
+    lines.append(
+        "算法检测平均准确率（人工确认）："
+        + (f"{accuracy:.1f}%" if accuracy is not None else "—")
+    )
+    lines.append("")
+    if not channels:
+        lines.append("当日没有人工确认的串流记录。")
+    for channel in channels:
+        lines.append(
+            f"通道：{channel['channelCode']} / {channel['channelName'] or '—'}")
+        lines.append(
+            f"今日真实串流：{channel['today']} 次 · 检测值："
+            f"{_value_text(channel['todayValues'])}")
+        lines.append(
+            f"前日真实串流：{channel['previous']} 次 · 检测值："
+            f"{_value_text(channel['previousValues'])}")
+        lines.append(
+            "相同检测值："
+            + ("、".join(channel["sameValues"]) if channel["sameValues"] else "无")
+        )
+        lines.append(f"变化：{channel['change']:+d} 次")
+        for stop in channel["stops"]:
+            lines.append(
+                f"停止：{stop['stoppedAt']}（最后确认串流；之后连续 3 轮未确认）")
+            if stop.get("restartedAt"):
+                lines.append(f"重新串流：{stop['restartedAt']}")
+        if not channel["stops"]:
+            lines.append("停止/重新串流：未判定（不足连续 3 轮）")
+        lines.append("")
+    lines.append("说明：只统计人工确认为真实串流的记录；误报不计入通道串流次数。")
+
+    return {
+        "date": date,
+        "available": ready,
+        "reason": reason,
+        "accuracy": accuracy,
+        "checked": checked,
+        "confirmed": len(confirmed),
+        "falsePositive": len(false_positive),
+        "channels": channels,
+        "text": "\n".join(lines).rstrip() + "\n",
+    }
+
+
+def round_csv(date: str, round_key: str) -> dict[str, str]:
+    """CSV for one round, containing only human-confirmed rows."""
+    today = today_str()
+    if date > today:
+        raise ValueError("不能查询未来日期")
+    if date == today:
+        groups, _meta = _live_groups(date)
+    else:
+        groups, _meta = _history_groups(date)
+    confirmations = {
+        row["row_key"]: row
+        for row in confirmation_store.list_for_date(date)
+    }
+    confirmations = _auto_confirm_rows(date, groups, confirmations)
+    group = next((item for item in groups if item.get("key") == round_key), None)
+    if group is None:
+        raise ValueError("该轮次不存在")
+    confirmations = {
+        key: row for key, row in confirmations.items()
+        if row.get("result") in CONFIRM_RESULTS
+    }
+    output = io.StringIO(newline="")
+    output.write("\ufeff")
+    writer = csv.writer(output)
+    writer.writerow([
+        "时间", "编号", "通道编码", "通道名称", "期望", "识别",
+        "置信度", "算法状态", "确认结果", "确认时间",
+    ])
+    for row in sorted(
+            group["rows"], key=lambda item: (item["time"], item["index"] or 0)):
+        confirmation = confirmations.get(_row_id(row))
+        if confirmation is None:
+            continue
+        writer.writerow([
+            row["time"],
+            row["index"] if row["index"] is not None else "",
+            row["channelCode"],
+            row["name"],
+            row["expected"],
+            row["detected"],
+            "" if row["confidence"] is None else f"{row['confidence']:.3f}",
+            row["status"],
+            "确认" if confirmation["result"] == "confirmed" else "误报",
+            confirmation.get("confirmed_at") or "",
+        ])
+    safe_key = re.sub(r"[^0-9A-Za-z_-]+", "_", round_key)
+    return {
+        "filename": f"osd_round_{date}_{safe_key}.csv",
+        "content": output.getvalue(),
+    }
+
+
+def save_confirmation(
+    row_key: str,
+    result: str | None,
+    *,
+    source: str = "",
+    actor: str = "",
+) -> dict[str, Any]:
+    """Create/update/clear one today's row confirmation."""
+    result = (result or "").strip() or None
+    if result is not None and result not in CONFIRM_RESULTS:
+        raise ValueError("无效的确认结果")
+
+    today = today_str()
+    target: dict[str, Any] | None = None
+    groups, _meta = _live_groups(today)
+    for group in groups:
+        for row in group["rows"]:
+            if _row_id(row) == row_key:
+                target = row
+                break
+        if target is not None:
+            break
+    if target is None:
+        raise ValueError("只能确认当天的异常记录")
+    if not (target.get("status") or "").upper().startswith("MISMATCH"):
+        raise ValueError("只能确认 MISMATCH 记录")
+
+    previous = confirmation_store.get(row_key)
+    now = now_beijing().strftime("%Y-%m-%d %H:%M:%S")
+    if result is None:
+        if previous is not None:
+            confirmation_store.delete(row_key)
+            confirmation_store.delete_auto_after(
+                target["channelCode"], today, target["time"])
+            confirmation_store.log_event(
+                row_key=row_key, action="clear", at=now,
+                confirm_date=today, channel_code=target["channelCode"],
+                actor=actor, source=source,
+            )
+        return {
+            "rowKey": row_key,
+            "result": None,
+            "confirmedAt": "",
+        }
+
+    record = confirmation_store.save(
+        row_key=row_key,
+        confirm_date=today,
+        time=target["time"],
+        channel_code=target["channelCode"],
+        channel_name=target.get("name") or "",
+        result=result,
+        note="",
+        confirmed_at=now,
+        actor=actor,
+        source=source,
+    )
+    confirmation_store.delete_auto_after(
+        target["channelCode"], today, target["time"])
+    confirmation_store.log_event(
+        row_key=row_key,
+        action="confirm",
+        result=result,
+        note="",
+        at=now,
+        confirm_date=today,
+        channel_code=target["channelCode"],
+        actor=actor,
+        source=source,
+    )
+    return {
+        "rowKey": row_key,
+        "result": record.get("result") if record else result,
+        "confirmedAt": record.get("confirmed_at") if record else now,
+    }
+
+
 def _history_groups(date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows, files = _archive_rows_for_date(date)
 
@@ -721,19 +1216,19 @@ def get_results(
     date: str | None = None,
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
-    channel_code: str = "",
+    channel_name: str = "",
     order: str = "desc",
 ) -> dict[str, Any]:
     """Return one page of anomalies, grouped by detection round."""
     today = today_str()
     date = date or today
-    channel_code = (channel_code or "").strip()
+    channel_name = (channel_name or "").strip()
     is_today = date == today
 
     if date > today:
         raise ValueError("不能查询未来日期")
-    if channel_code and not is_today:
-        raise ValueError("通道编码搜索仅支持当天结果")
+    if channel_name and not is_today:
+        raise ValueError("通道名称搜索仅支持当天结果")
 
     page_size = max(1, min(int(page_size), MAX_PAGE_SIZE))
     order = "asc" if order == "asc" else "desc"
@@ -743,16 +1238,22 @@ def get_results(
     else:
         groups, meta = _history_groups(date)
 
+    confirmations = {
+        row["row_key"]: row
+        for row in confirmation_store.list_for_date(date)
+    }
+    confirmations = _auto_confirm_rows(date, groups, confirmations)
+
     total = sum(len(group["rows"]) for group in groups)
     round_count = len(groups)
 
-    if channel_code:
-        needle = channel_code.casefold()
+    if channel_name:
+        needle = channel_name.casefold()
         filtered: list[dict[str, Any]] = []
         for group in groups:
             matched_rows = [
                 row for row in group["rows"]
-                if needle in row["channelCode"].casefold()
+                if needle in (row["name"] or "").casefold()
             ]
             if matched_rows:
                 copied = dict(group)
@@ -820,11 +1321,24 @@ def get_results(
                 if row["hasImage"]:
                     row["frameDir"] = frame_dir
 
+            key = _row_id(row)
+            confirmation = confirmations.get(key)
+            row["rowKey"] = key
+            row["confirmResult"] = (confirmation.get("result")
+                                    if confirmation else None)
+            row["confirmSource"] = (confirmation.get("source")
+                                    if confirmation else None)
+            row["confirmAt"] = (confirmation.get("confirmed_at", "")
+                                if confirmation else "")
+            row["confirmEditable"] = bool(
+                is_today
+                and (row["status"] or "").upper().startswith("MISMATCH"))
+
     return {
         "date": date,
         "today": today,
         "isToday": is_today,
-        "search": channel_code or None,
+        "search": channel_name or None,
         "source": meta["source"],
         "roundSource": meta["roundSource"],
         "updatedAt": meta["source"].get("updatedAt"),

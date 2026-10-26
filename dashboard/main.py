@@ -1,12 +1,14 @@
-"""Small read-only web dashboard for output/osd_error.txt.
+"""Dashboard for output/osd_error.txt.
 
-This is a standalone demo service: it only reads the monitor's files and does
-not change the osd20 container or any of its scripts.
+Detection files stay read-only.  Human confirmations and the daily report
+state are stored in a separate SQLite database, so this service never changes
+the osd20 container or any of its files.
 """
 from __future__ import annotations
 
 import base64
 import html
+import mimetypes
 import os
 import secrets
 import threading
@@ -21,12 +23,15 @@ from fastapi.responses import (
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
+    Response,
 )
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 import data
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+mimetypes.add_type("font/woff2", ".woff2")
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "osd")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
 SESSION_COOKIE = "osd_dashboard_session"
@@ -38,8 +43,8 @@ _session_lock = threading.Lock()
 
 app = FastAPI(
     title="OSD 检测结果看板（Demo）",
-    version="0.2.0",
-    description="只读展示 output/osd_error.txt 与 Logs 历史归档。",
+    version="0.4.0",
+    description="检测数据只读展示；人工确认结果和日报状态单独存储。",
 )
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -86,6 +91,30 @@ def _login_html(error: str = "") -> str:
     if error:
         block = f'<p class="error" role="alert">{html.escape(error)}</p>'
     return LOGIN_TEMPLATE.replace("{{ERROR}}", block)
+
+
+class ConfirmationRequest(BaseModel):
+    row_key: str
+    result: str | None = None
+
+
+def _same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    host = (request.headers.get("x-forwarded-host")
+            or request.headers.get("host", ""))
+    try:
+        origin_host = origin.split("://", 1)[1].split("/", 1)[0]
+    except IndexError:
+        return False
+    return origin_host.casefold() == host.casefold()
+
+
+def _write_context(request: Request) -> tuple[str, str]:
+    if DASHBOARD_PASSWORD:
+        return "public", DASHBOARD_USER
+    return "internal", "internal"
 
 
 @app.middleware("http")
@@ -178,8 +207,11 @@ def results(
     page_size: int = Query(
         data.DEFAULT_PAGE_SIZE, ge=1, le=data.MAX_PAGE_SIZE,
         description="rows per page"),
+    channel_name: str | None = Query(
+        None, description="channel name substring; today's results only"),
     channel_code: str | None = Query(
-        None, description="channel code substring; today's results only"),
+        None, include_in_schema=False, deprecated=True,
+        description="deprecated alias for channel_name"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
 ) -> dict:
     chosen = date or data.today_str()
@@ -195,8 +227,74 @@ def results(
             date=chosen,
             page=page,
             page_size=page_size,
-            channel_code=channel_code or "",
+            channel_name=channel_name or channel_code or "",
             order=order,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _valid_date(value: str) -> str:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+
+
+@app.get("/api/dashboard/report", summary="Completed-day stream report")
+def daily_report(date: str = Query(..., description="YYYY-MM-DD")) -> dict:
+    return data.build_daily_report(_valid_date(date))
+
+
+@app.get("/api/dashboard/report.txt", summary="Download completed-day report")
+def daily_report_txt(date: str = Query(..., description="YYYY-MM-DD")) -> Response:
+    chosen = _valid_date(date)
+    report = data.build_daily_report(chosen)
+    if not report["available"]:
+        raise HTTPException(status_code=409, detail=report["reason"])
+    return Response(
+        content=report["text"],
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="osd_report_{chosen}.txt"',
+        },
+    )
+
+
+@app.get("/api/dashboard/round.csv", summary="Download one round as CSV")
+def round_csv(
+    date: str = Query(..., description="YYYY-MM-DD"),
+    round_key: str = Query(..., min_length=1),
+) -> Response:
+    chosen = _valid_date(date)
+    try:
+        result = data.round_csv(chosen, round_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return Response(
+        content=result["content"],
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="{result["filename"]}"',
+        },
+    )
+
+
+@app.post("/api/dashboard/confirmations",
+          summary="Confirm or reject today's detected row")
+def save_confirmation(payload: ConfirmationRequest, request: Request) -> dict:
+    if not _same_origin(request):
+        raise HTTPException(status_code=403, detail="跨站请求被拒绝")
+    source, actor = _write_context(request)
+    try:
+        return data.save_confirmation(
+            payload.row_key,
+            payload.result,
+            source=source,
+            actor=actor,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

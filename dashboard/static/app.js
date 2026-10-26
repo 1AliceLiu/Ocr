@@ -39,6 +39,10 @@
     chartZoomIn: $("chartZoomIn"),
     chartZoomReset: $("chartZoomReset"),
     chartZoomLabel: $("chartZoomLabel"),
+    chartTooltip: $("chartTooltip"),
+    chartTooltipDevice: $("chartTooltipDevice"),
+    chartTooltipChannel: $("chartTooltipChannel"),
+    chartTooltipCount: $("chartTooltipCount"),
     chartClose: $("chartClose"),
     imageModal: $("imageModal"),
     imageModalTitle: $("imageModalTitle"),
@@ -52,6 +56,11 @@
     imageZoomLabel: $("imageZoomLabel"),
     imageClose: $("imageClose"),
     notice: $("notice"),
+    dailyReport: $("dailyReport"),
+    dailyReportTitle: $("dailyReportTitle"),
+    dailyReportSub: $("dailyReportSub"),
+    dailyReportText: $("dailyReportText"),
+    reportDownload: $("reportDownload"),
     results: $("results"),
     pagination: $("pagination"),
     pageSummary: $("pageSummary"),
@@ -95,6 +104,46 @@
     return numberFormat.format(Number(value) || 0);
   }
 
+  const CHART_TOOLTIP_OFFSET = 14;
+
+  function showChartTooltip(item, event) {
+    if (!els.chartTooltip) return;
+    const deviceName = item.deviceName || item.name || "—";
+    const channelCode = item.name || "—";
+    els.chartTooltipDevice.textContent = deviceName;
+    els.chartTooltipChannel.textContent = channelCode;
+    els.chartTooltipCount.textContent = `${formatNumber(item.count)} 次`;
+    els.chartTooltip.classList.remove("hidden");
+    els.chartTooltip.setAttribute("aria-hidden", "false");
+    positionChartTooltip(event);
+  }
+
+  function positionChartTooltip(event) {
+    if (!els.chartTooltip || els.chartTooltip.classList.contains("hidden")) {
+      return;
+    }
+    const pad = 12;
+    const rect = els.chartTooltip.getBoundingClientRect();
+    let x = event.clientX + CHART_TOOLTIP_OFFSET;
+    let y = event.clientY + CHART_TOOLTIP_OFFSET;
+    if (x + rect.width > window.innerWidth - pad) {
+      x = event.clientX - rect.width - CHART_TOOLTIP_OFFSET;
+    }
+    if (y + rect.height > window.innerHeight - pad) {
+      y = event.clientY - rect.height - CHART_TOOLTIP_OFFSET;
+    }
+    x = Math.max(pad, Math.min(x, window.innerWidth - rect.width - pad));
+    y = Math.max(pad, Math.min(y, window.innerHeight - rect.height - pad));
+    els.chartTooltip.style.left = `${x}px`;
+    els.chartTooltip.style.top = `${y}px`;
+  }
+
+  function hideChartTooltip() {
+    if (!els.chartTooltip) return;
+    els.chartTooltip.classList.add("hidden");
+    els.chartTooltip.setAttribute("aria-hidden", "true");
+  }
+
   function element(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -120,8 +169,8 @@
     els.searchControl.classList.toggle("is-disabled", !isToday);
     els.searchHint.classList.toggle("warn", !isToday);
     els.searchHint.textContent = isToday
-      ? "仅搜索当天结果，支持通道编码子串匹配"
-      : "历史日期不支持按通道编码搜索";
+      ? "仅搜索当天结果，支持通道名称子串匹配（不区分大小写）"
+      : "历史日期不支持按通道名称搜索";
   }
 
   function setLoading(loading) {
@@ -300,6 +349,10 @@
       pinchStartDistance = 0;
     }, { passive: true });
 
+    window.addEventListener("scroll", hideChartTooltip, { passive: true });
+    window.addEventListener("resize", hideChartTooltip);
+    els.chartModalScroll.addEventListener("scroll", hideChartTooltip, { passive: true });
+
     els.imageClose.addEventListener("click", closeImageModal);
     els.imageModal.addEventListener("click", (event) => {
       if (event.target.closest("[data-image-close]")) closeImageModal();
@@ -369,6 +422,10 @@
         state.page = 1;
         syncSearchState();
         loadResults();
+      } else if (button.dataset.action === "confirm-row") {
+        saveConfirmation(button);
+      } else if (button.dataset.action === "download-round") {
+        downloadRoundCsv(button);
       }
     });
   }
@@ -393,6 +450,7 @@
 
   async function loadResults() {
     if (!state.date) return;
+    hideChartTooltip();
 
     const requestId = ++state.requestId;
     if (state.controller) state.controller.abort();
@@ -406,7 +464,7 @@
       order: "desc",
     });
     if (state.search && state.date === state.today) {
-      params.set("channel_code", state.search);
+      params.set("channel_name", state.search);
     }
 
     try {
@@ -457,6 +515,7 @@
       }
     }
     renderPagination(data);
+    loadReport();
   }
 
   function renderStats(data) {
@@ -507,6 +566,7 @@
   }
 
   function renderChart(data) {
+    hideChartTooltip();
     const streaming = data && data.streaming;
     state.streaming = streaming && Number(streaming.totalRows) > 0
       ? streaming
@@ -568,6 +628,7 @@
     const topN = Math.max(1, Math.min(CHART_SMALL_TOP, series.length || CHART_SMALL_TOP));
     els.chartTitle.textContent = chartTitleText(data, topN);
     els.chartSubtitle.textContent = chartSubtitleText();
+    hideChartTooltip();
     els.chartSmall.replaceChildren();
     els.chartOpenBtn.disabled = series.length === 0;
     els.chartThumb.disabled = series.length === 0;
@@ -594,6 +655,9 @@
       xTitle,
       yTitle: "MISMATCH 次数",
       axisTitleSize: 18,
+      tickFontSize: 17,
+      valueFontSize: 17,
+      labelFontSize: 17,
       gradientFrom: "#3b82f6",
       gradientTo: "#0e7490",
     }));
@@ -614,6 +678,9 @@
     const slot = plotWidth / Math.max(1, series.length);
     const barWidth = Math.min(options.maxBarWidth, slot * 0.62);
     const gradientId = `chart-gradient-${options.id}`;
+    const tickFontSize = options.tickFontSize || 14;
+    const valueFontSize = options.valueFontSize || 14;
+    const labelFontSize = options.labelFontSize || 14;
 
     const svg = svgElement("svg", {
       viewBox: `0 0 ${width} ${height}`,
@@ -661,6 +728,7 @@
         class: "chart-axis-text",
         "text-anchor": "end",
       });
+      label.style.fontSize = `${tickFontSize}px`;
       label.textContent = formatNumber(Math.round(value));
       svg.append(label);
     }
@@ -701,6 +769,9 @@
       const y = baseline - barHeight;
       const centerX = x + barWidth / 2;
 
+      const barGroup = svgElement("g", { class: "chart-bar-group" });
+      barGroup.style.transformOrigin = `${centerX}px ${baseline}px`;
+
       const bar = svgElement("rect", {
         x,
         y,
@@ -714,12 +785,11 @@
       const labelValue = options.labelKey === "deviceName"
         ? (item.deviceName || item.name)
         : item.name;
-      const tip = svgElement("title");
-      tip.textContent = options.labelKey === "deviceName"
-        ? `设备 ${labelValue} · 通道 ${item.name}：${formatNumber(count)} 次`
-        : `${item.name}（设备 ${item.deviceName || "—"}）：${formatNumber(count)} 次`;
-      bar.append(tip);
-      svg.append(bar);
+      bar.setAttribute(
+        "aria-label",
+        `设备名称 ${item.deviceName || item.name || "—"}，通道编码 ${item.name || "—"}，串流次数 ${formatNumber(count)} 次`
+      );
+      barGroup.append(bar);
 
       const value = svgElement("text", {
         x: centerX,
@@ -727,8 +797,16 @@
         class: "chart-value",
         "text-anchor": "middle",
       });
+      value.style.fontSize = `${valueFontSize}px`;
       value.textContent = formatNumber(count);
-      svg.append(value);
+      barGroup.append(value);
+      svg.append(barGroup);
+
+      bar.addEventListener("mouseenter", (event) => {
+        showChartTooltip(item, event);
+      });
+      bar.addEventListener("mousemove", positionChartTooltip);
+      bar.addEventListener("mouseleave", hideChartTooltip);
 
       const labelY = baseline + 16;
       const label = svgElement("text", {
@@ -742,6 +820,7 @@
       label.textContent = truncateLabel(
         labelValue, options.labelChars, options.labelHeadRatio
       );
+      label.style.fontSize = `${labelFontSize}px`;
       const labelTip = svgElement("title");
       labelTip.textContent = labelValue;
       label.append(labelTip);
@@ -800,6 +879,7 @@
 
   function openChartModal() {
     if (!state.streaming || chartSeries().length === 0) return;
+    hideChartTooltip();
     if (state.imageOpen) closeImageModal();
     state.chartLastFocus = document.activeElement;
     state.chartModalOpen = true;
@@ -811,6 +891,7 @@
   }
 
   function closeChartModal() {
+    hideChartTooltip();
     if (!state.chartModalOpen) return;
     state.chartModalOpen = false;
     state.chartModalSvgs = [];
@@ -823,6 +904,7 @@
   }
 
   function renderModalChart(data) {
+    hideChartTooltip();
     if (!data || !state.streaming) return;
     const series = chartSeries().slice(0, CHART_MODAL_TOP);
     const topN = Math.max(1, Math.min(CHART_MODAL_TOP, series.length || CHART_MODAL_TOP));
@@ -862,6 +944,9 @@
       xTitle,
       yTitle: "MISMATCH 次数",
       axisTitleSize: 28,
+      tickFontSize: 23,
+      valueFontSize: 23,
+      labelFontSize: 23,
       gradientFrom: "#3b82f6",
       gradientTo: "#0e7490",
     });
@@ -872,6 +957,7 @@
   }
 
   function setChartZoom(next) {
+    hideChartTooltip();
     state.chartZoom = Math.min(
       4,
       Math.max(0.5, Math.round((Number(next) || 1) * 100) / 100)
@@ -1033,6 +1119,91 @@
     els.notice.classList.remove("hidden");
   }
 
+  async function loadReport() {
+    if (!els.dailyReport || !state.date) return;
+    const date = state.date;
+    try {
+      const response = await fetch(
+        `/api/dashboard/report?date=${encodeURIComponent(date)}`,
+        { cache: "no-store", headers: { Accept: "application/json" } }
+      );
+      const report = await readJson(response);
+      if (state.date !== date) return;
+      renderReport(report);
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      els.dailyReport.classList.add("hidden");
+    }
+  }
+
+  function renderReport(report) {
+    if (!report) {
+      els.dailyReport.classList.add("hidden");
+      return;
+    }
+    if (!report.available &&
+        String(report.reason || "").includes("没有轮次数据")) {
+      els.dailyReport.classList.add("hidden");
+      return;
+    }
+
+    els.dailyReport.classList.remove("hidden");
+    els.dailyReportTitle.textContent = `${report.date || state.date} 串流日报`;
+    if (report.available) {
+      els.dailyReportSub.textContent =
+        `已确认 ${formatNumber(report.checked)} 条 · 真实串流 ${formatNumber(report.confirmed)} 条 · 误报 ${formatNumber(report.falsePositive)} 条`;
+      els.dailyReportText.textContent = report.text || "";
+      els.dailyReportText.classList.remove("hidden");
+      els.reportDownload.href =
+        `/api/dashboard/report.txt?date=${encodeURIComponent(report.date)}`;
+      els.reportDownload.classList.remove("hidden");
+    } else {
+      els.dailyReportSub.textContent = report.reason || "日报尚未生成";
+      els.dailyReportText.textContent = "";
+      els.dailyReportText.classList.add("hidden");
+      els.reportDownload.classList.add("hidden");
+    }
+  }
+
+  async function saveConfirmation(button) {
+    const rowKey = button.dataset.rowKey || "";
+    const result = button.dataset.result || "";
+    if (!rowKey || !result) return;
+    const actions = button.closest(".confirm-actions");
+    const buttons = actions
+      ? Array.from(actions.querySelectorAll("button"))
+      : [button];
+    buttons.forEach((item) => { item.disabled = true; });
+
+    try {
+      const response = await fetch("/api/dashboard/confirmations", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ row_key: rowKey, result }),
+      });
+      await readJson(response);
+      await loadResults();
+    } catch (error) {
+      window.alert(error.message || "确认失败");
+      buttons.forEach((item) => { item.disabled = false; });
+    }
+  }
+
+  function downloadRoundCsv(button) {
+    const params = new URLSearchParams({
+      date: button.dataset.roundDate || "",
+      round_key: button.dataset.roundKey || "",
+    });
+    const link = document.createElement("a");
+    link.href = `/api/dashboard/round.csv?${params.toString()}`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+  }
+
   function buildRound(group, data) {
     const card = element("section", "round-card");
     const head = element("div", "round-head");
@@ -1117,6 +1288,16 @@
       right.append(element("span", "round-summary", "本轮未写入完成汇总"));
     }
 
+    if (group.key) {
+      const csv = element("button", "round-csv-btn", "下载 CSV");
+      csv.type = "button";
+      csv.title = "只导出已人工确认的行";
+      csv.dataset.action = "download-round";
+      csv.dataset.roundKey = group.key;
+      csv.dataset.roundDate = data.date || "";
+      right.append(csv);
+    }
+
     head.append(left, right);
 
     const scroll = element("div", "table-scroll");
@@ -1133,6 +1314,7 @@
       ["col-confidence", "置信度"],
       ["col-status", "状态"],
       ["col-sample", "样例"],
+      ["col-confirm", "确认"],
     ];
     for (const [className, label] of columns) {
       const th = element("th", className, label);
@@ -1180,6 +1362,7 @@
     tr.append(buildConfidenceCell(row.confidence));
     tr.append(buildStatusCell(row.status));
     tr.append(buildSampleCell(row, data));
+    tr.append(buildConfirmCell(row, data));
     return tr;
   }
 
@@ -1201,6 +1384,59 @@
       }
       td.append(empty);
     }
+    return td;
+  }
+
+  function buildConfirmCell(row, data) {
+    const td = element("td", "cell-confirm");
+    const result = row.confirmResult;
+    if (!row.confirmEditable) {
+      let chip = null;
+      if (result === "confirmed") {
+        chip = element("span", "confirm-chip is-confirmed", "确认");
+      } else if (result === "false_positive") {
+        chip = element("span", "confirm-chip is-false", "误报");
+      }
+      if (chip) {
+        if (result === "confirmed" && row.confirmSource === "auto") {
+          chip.title = "系统根据上一轮确认自动标记";
+        }
+        td.append(chip);
+      } else {
+        td.append(element("span", "confirm-empty", "—"));
+      }
+      return td;
+    }
+
+    const wrap = element("div", "confirm-actions");
+    for (const [value, label, tone] of [
+      ["confirmed", "确认", "is-confirmed"],
+      ["false_positive", "误报", "is-false"],
+    ]) {
+      const button = element(
+        "button",
+        `confirm-btn ${tone}${result === value ? " active" : ""}`,
+        label
+      );
+      button.type = "button";
+      button.dataset.action = "confirm-row";
+      button.dataset.result = value;
+      button.dataset.rowKey = row.rowKey || "";
+      button.title = value === "confirmed"
+        ? "确认为真实串流"
+        : "标记为算法误报";
+      if (result === value && value === "confirmed"
+          && row.confirmSource === "auto") {
+        button.title = "系统根据上一轮确认自动标记";
+      }
+      wrap.append(button);
+    }
+    if (result === "confirmed" && row.confirmSource === "auto") {
+      const auto = element("span", "confirm-auto", "自动");
+      auto.title = "系统根据上一轮确认自动标记";
+      wrap.append(auto);
+    }
+    td.append(wrap);
     return td;
   }
 
@@ -1280,9 +1516,9 @@
     let title;
     let description;
     if (data.search) {
-      title = "没有匹配的通道编码";
+      title = "没有匹配的通道名称";
       description =
-        `没有找到通道编码包含“${data.search}”的当天记录。可以清除搜索查看全部结果。`;
+        `没有找到通道名称包含“${data.search}”的当天记录。可以清除搜索查看全部结果。`;
     } else if (data.isToday) {
       title = "今天还没有异常记录";
       description =
@@ -1305,6 +1541,8 @@
   }
 
   function renderError(error) {
+    hideChartTooltip();
+    if (els.dailyReport) els.dailyReport.classList.add("hidden");
     state.data = null;
     state.streaming = null;
     els.chartPanel.classList.add("hidden");

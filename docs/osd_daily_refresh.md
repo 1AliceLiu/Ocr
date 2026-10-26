@@ -1,9 +1,9 @@
-# 每天 09:00 自动刷新 streams.txt 并重启 OSD 检测
+# 每天 06:30 自动刷新 streams.txt 并重启 OSD 检测
 
 `evo_osd_monitor.py` 只在**启动时读一次** `out/streams.txt`，所以改了列表必须重启
 监控进程才会生效。这个服务把两件事串起来：
 
-1. 每天 **北京时间 09:00** 调用 `scripts/evo_pull.py --with-streams --stream-mode template`
+1. 每天 **北京时间 06:30** 调用 `scripts/evo_pull.py --with-streams --stream-mode template`
    重新拉取通道列表；
 2. 校验新列表（行数、是否比旧表小太多），通过后**原子替换** `out/streams.txt`，
    同时更新 `out/devices.csv`、`out/channels.csv`；
@@ -30,7 +30,7 @@ docker compose logs -f osd-daily
 启动后日志会打印下一次执行时间：
 
 ```
-2026-10-21 10:12:03 next refresh at 09:00 Beijing (in 22.80 h)
+2026-10-21 06:50:03 next refresh at 06:30 Beijing (in 23.67 h)
 ```
 
 ## 2. 手动验证（推荐先跑这个）
@@ -52,13 +52,13 @@ docker compose exec osd-daily \
 正常输出示例：
 
 ```
-2026-10-21 09:00:02 pull: /opt/conda/bin/python /work/scripts/evo_pull.py --outdir /tmp/osd-refresh-abcd1234 --with-streams --stream-mode template
+2026-10-21 06:30:02 pull: /opt/conda/bin/python /work/scripts/evo_pull.py --outdir /tmp/osd-refresh-abcd1234 --with-streams --stream-mode template
 ...
-2026-10-21 09:00:31 rows: new=1521 current=1521
-2026-10-21 09:00:31 replaced /work/out/streams.txt (1521 rows)
-2026-10-21 09:00:31 replaced /work/out/devices.csv
-2026-10-21 09:00:31 replaced /work/out/channels.csv
-2026-10-21 09:00:33 docker: restarted osd20 (a1b2c3d4e5f6)
+2026-10-21 06:30:31 rows: new=1521 current=1521
+2026-10-21 06:30:31 replaced /work/out/streams.txt (1521 rows)
+2026-10-21 06:30:31 replaced /work/out/devices.csv
+2026-10-21 06:30:31 replaced /work/out/channels.csv
+2026-10-21 06:30:33 docker: restarted osd20 (a1b2c3d4e5f6)
 ```
 
 ## 3. 安全措施
@@ -83,7 +83,7 @@ docker compose exec osd-daily \
       - /work/scripts/daily_refresh.py
       - --watch
       - --time
-      - "${REFRESH_TIME:-09:00}"     # 改 .env 的 REFRESH_TIME 即可
+      - "${REFRESH_TIME:-06:30}"     # 改 .env 的 REFRESH_TIME 即可
 ```
 
 脚本还支持：
@@ -105,7 +105,7 @@ docker compose exec osd-daily python /work/scripts/daily_refresh.py --once -- \
 ## 5. 注意事项
 
 - **会中断当前这一轮**：重启 osd20 时，正在进行的那一轮会从头开始，已经检测的通道会重跑。
-  每天 09:00 执行一次，影响可控；如果希望避开，改 `REFRESH_TIME`。
+  每天 06:30 执行一次，影响可控；如果希望避开，改 `REFRESH_TIME`。
 - **挂载了 `/var/run/docker.sock`**：`osd-daily` 需要它来重启 osd20。
   这等于给了该容器控制 Docker 的权限，仅限本机可信环境；不接受的话用下面的 cron 方案。
 - **时区**：脚本固定按 UTC+8 判断，不依赖容器/宿主时区。
@@ -118,8 +118,8 @@ docker compose exec osd-daily python /work/scripts/daily_refresh.py --once -- \
 ## 6. 不想用容器的话（宿主机 cron）
 
 ```bash
-# 每天 09:00（宿主机时区需为 Asia/Shanghai，或用 01:00 UTC）
-0 9 * * * cd /home/lsb/orc/orc && \
+# 每天 06:30（宿主机时区需为 Asia/Shanghai，或用 22:30 UTC）
+30 6 * * * cd /home/lsb/orc/orc && \
   docker compose run --rm -T osd-daily python /work/scripts/daily_refresh.py --once >> /var/log/osd-refresh.log 2>&1
 ```
 

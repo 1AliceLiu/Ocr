@@ -12,7 +12,9 @@ Rules:
   * rows that are about to be deleted are first archived to
     `Logs/YYYYMMDD_osd_error.csv` (UTF-8 BOM CSV, one row per anomaly);
   * anomaly frames in `snapshots/osd_error/round_<N>_<time>/` that belong to
-    deleted rows are deleted too (use --no-images to disable this).
+    deleted rows are deleted too (use --no-images to disable this);
+  * as a safety net, any image file captured before the cutoff is deleted even
+    when its row never reached osd_error.txt (notably UNCERTAIN frames).
 
 The file is rewritten IN PLACE (truncate + write, same inode). This matters:
 the monitor keeps the file open with O_APPEND for a whole round, so replacing
@@ -252,6 +254,48 @@ def delete_round_images(
     return deleted, errors
 
 
+def delete_old_images(
+        image_dir: Path | None, cutoff: str, dry_run: bool
+) -> tuple[int, list[str]]:
+    """Remove any image captured before the retention cutoff.
+
+    Row-based cleanup cannot see frames for statuses that never reached
+    osd_error.txt (notably UNCERTAIN), so sweep by the file's capture date as
+    a safety net.  The file mtime is used rather than the folder name so a
+    cross-midnight round keeps frames captured on the current day.
+    """
+    if image_dir is None or not image_dir.is_dir():
+        return 0, []
+    deleted = 0
+    errors: list[str] = []
+    folders: set[Path] = set()
+    for folder in image_dir.glob("round_*"):
+        if not folder.is_dir():
+            continue
+        folders.add(folder)
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                captured = datetime.fromtimestamp(
+                    path.stat().st_mtime, BEIJING_TZ).strftime("%Y-%m-%d")
+                if captured >= cutoff:
+                    continue
+                if not dry_run:
+                    path.unlink()
+                deleted += 1
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+    if not dry_run:
+        for folder in folders:
+            try:
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+            except OSError as exc:
+                errors.append(f"{folder}: {exc}")
+    return deleted, errors
+
+
 def prune(path: Path, keep_days: int, dry_run: bool,
           archive_dir: Path | None = None,
           image_dir: Path | None = None
@@ -283,6 +327,12 @@ def prune(path: Path, keep_days: int, dry_run: bool,
 
     deleted_images, image_errors = delete_round_images(
         dropped_round_rows, image_dir, dry_run)
+    cutoff = (now_beijing() - timedelta(days=max(0, keep_days - 1))).strftime(
+        "%Y-%m-%d")
+    old_deleted, old_errors = delete_old_images(
+        image_dir, cutoff, dry_run)
+    deleted_images += old_deleted
+    image_errors.extend(old_errors)
     return (len(kept), len(dropped), archived_rows, archive_path,
             deleted_images, image_errors)
 

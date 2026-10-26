@@ -7,6 +7,10 @@
   <title>OSD 检测结果</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='32' y='42' font-family='Arial,sans-serif' font-size='24' font-weight='700' text-anchor='middle' fill='white'%3EOSD%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="preload" href="/static/fonts/inter-variable.woff2" as="font"
+        type="font/woff2" crossorigin>
+  <link rel="preload" href="/static/fonts/jetbrains-mono-variable.woff2" as="font"
+        type="font/woff2" crossorigin>
 </head>
 <body>
   <div class="page-glow" aria-hidden="true"></div>
@@ -48,7 +52,7 @@
       </div>
 
       <div class="control search-control" id="searchControl">
-        <label for="searchInput">通道编码</label>
+        <label for="searchInput">通道名称</label>
         <div class="control-row">
           <div class="input-shell search-shell">
             <span class="input-icon" aria-hidden="true">
@@ -58,12 +62,12 @@
               </svg>
             </span>
             <input type="search" id="searchInput" autocomplete="off" spellcheck="false"
-                   placeholder="搜索当天结果，例如 1002484$1$0$0">
+                   placeholder="搜索当天结果，例如 2341_1">
           </div>
           <button type="button" class="btn primary" id="searchBtn">搜索</button>
           <button type="button" class="btn ghost" id="clearSearchBtn" disabled>清除</button>
         </div>
-        <p class="hint" id="searchHint">仅支持搜索当天结果</p>
+        <p class="hint" id="searchHint">仅支持搜索当天结果的通道名称</p>
       </div>
 
       <div class="control refresh-control">
@@ -123,6 +127,18 @@
 
     <div class="notice hidden" id="notice" role="status"></div>
 
+    <section class="panel daily-report hidden" id="dailyReport">
+      <div class="daily-report-head">
+        <div>
+          <h2 id="dailyReportTitle">串流日报</h2>
+          <p class="daily-report-sub" id="dailyReportSub">—</p>
+        </div>
+        <a class="btn ghost report-download hidden" id="reportDownload"
+           href="#">下载 TXT</a>
+      </div>
+      <pre class="daily-report-text" id="dailyReportText"></pre>
+    </section>
+
     <main class="results" id="results" aria-live="polite">
       <div class="loading-card">
         <span class="spinner" aria-hidden="true"></span>
@@ -144,7 +160,7 @@
       </label>
     </footer>
 
-    <p class="footer-note">只读展示 · 历史数据来自 Logs 归档 · 本页面不会修改 osd20 检测任务</p>
+    <p class="footer-note">检测数据只读展示 · 人工确认和备注单独保存 · 不会修改 osd20 检测任务</p>
   </div>
 
   <div class="chart-modal hidden" id="chartModal" role="dialog" aria-modal="true"
@@ -203,6 +219,21 @@
       <p class="chart-modal-foot">
         拖动滚动条查看 · Ctrl/⌘ + 滚轮缩放 · 双指捏合缩放 · Esc 关闭
       </p>
+    </div>
+  </div>
+
+  <div class="chart-tooltip hidden" id="chartTooltip" role="tooltip" aria-hidden="true">
+    <div class="chart-tooltip-row">
+      <span class="chart-tooltip-label">设备名称</span>
+      <span class="chart-tooltip-value" id="chartTooltipDevice">—</span>
+    </div>
+    <div class="chart-tooltip-row">
+      <span class="chart-tooltip-label">通道编码</span>
+      <span class="chart-tooltip-value" id="chartTooltipChannel">—</span>
+    </div>
+    <div class="chart-tooltip-row">
+      <span class="chart-tooltip-label">串流次数</span>
+      <span class="chart-tooltip-value" id="chartTooltipCount">—</span>
     </div>
   </div>
 

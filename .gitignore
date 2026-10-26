@@ -20,6 +20,9 @@ __pycache__/
 # Temporary visualisation output
 temp/
 
+# Dashboard confirmations / report state
+state/
+
 # All csv files
 *.csv
 # All txt files

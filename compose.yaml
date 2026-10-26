@@ -150,7 +150,7 @@ services:
       - /work/snapshots/osd_error
     restart: unless-stopped
 
-  # 每天北京时间 09:00 重新拉取 out/streams.txt，然后重启 osd20 让新列表生效。
+  # 每天北京时间 06:30 重新拉取 out/streams.txt，然后重启 osd20 让新列表生效。
   # 需要挂载 /var/run/docker.sock（用来重启 osd20），详见 docs/osd_daily_refresh.md
   osd-daily:
     build: *easyocr-build
@@ -169,14 +169,14 @@ services:
       - /work/scripts/daily_refresh.py
       - --watch
       - --time
-      - "${REFRESH_TIME:-09:00}"
+      - "${REFRESH_TIME:-06:30}"
     restart: unless-stopped
 
-  # 只读结果看板（demo）：首页展示 output/osd_error.txt，支持按日期查归档、
-  # 按轮次分隔、按通道编码搜索当天结果、底部分页。
+  # 结果看板：首页展示 output/osd_error.txt，支持按日期查归档、
+  # 按轮次分隔、按通道名称搜索当天结果、人工确认、日报、底部分页。
   # 启动/更新：docker compose up -d --build osd-dashboard
   # 内网地址：http://<服务器IP>:8011 （可用 DASHBOARD_PORT 覆盖，免密）
-  # 该服务只读挂载项目目录，不修改 osd20 的代码或运行状态。
+  # 检测文件只读挂载；state/ 单独可写保存人工确认和备注，不修改 osd20。
   osd-dashboard:
     image: easyocr-dev-osd-dashboard:latest
     build:
@@ -192,11 +192,13 @@ services:
       HISTORY_ROUNDS: "1"
       DASHBOARD_PAGE_SIZE: "50"
       STREAM_TOP_N: "50"
+      CONFIRM_DB: /state/dashboard.db
       # 内网实例刻意不启用登录；公网访问请走 osd-dashboard-public。
       DASHBOARD_USER: ""
       DASHBOARD_PASSWORD: ""
     volumes:
       - ./:/work:ro
+      - ./state:/state
     restart: unless-stopped
     healthcheck:
       test:
@@ -228,11 +230,13 @@ services:
       HISTORY_ROUNDS: "1"
       DASHBOARD_PAGE_SIZE: "50"
       STREAM_TOP_N: "50"
+      CONFIRM_DB: /state/dashboard.db
       DASHBOARD_USER: ${DASHBOARD_USER:-osd}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
       DASHBOARD_SESSION_HOURS: "12"
     volumes:
       - ./:/work:ro
+      - ./state:/state
     restart: unless-stopped
     healthcheck:
       test:

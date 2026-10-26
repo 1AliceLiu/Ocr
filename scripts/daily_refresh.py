@@ -1,4 +1,4 @@
-"""Every day at 09:00 (Beijing): refresh out/streams.txt, then restart osd20.
+"""Every day at 06:30 (Beijing): refresh out/streams.txt, then restart osd20.
 
 `evo_osd_monitor.py` reads the channel list once at startup, so a new
 streams.txt only takes effect after the monitor process restarts. This service
@@ -13,7 +13,7 @@ does both steps:
      the new list. No `docker` CLI is needed, only /var/run/docker.sock.
 
 Usage:
-    python scripts/daily_refresh.py --watch          # daily at 09:00
+    python scripts/daily_refresh.py --watch          # daily at 06:30
     python scripts/daily_refresh.py --once           # refresh right now
     python scripts/daily_refresh.py --once --dry-run # pull + validate only
     python scripts/daily_refresh.py --once --no-restart
@@ -287,8 +287,8 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--outdir", default=os.getenv("STREAMS_DIR", "/work/out"),
                         help="directory holding streams.txt (default /work/out)")
-    parser.add_argument("--time", default="09:00",
-                        help="daily refresh time, Beijing (default 09:00)")
+    parser.add_argument("--time", default="06:30",
+                        help="daily refresh time, Beijing (default 06:30)")
     parser.add_argument("--watch", action="store_true",
                         help="run forever, refresh once a day at --time")
     parser.add_argument("--once", action="store_true",

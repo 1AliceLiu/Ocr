@@ -1,7 +1,8 @@
 # OSD 检测结果看板（Demo）
 
-一个独立的只读网页服务，用来浏览 `output/osd_error.txt` 里的异常检测结果。
-**不修改 `osd20` 服务或 `scripts/evo_osd_monitor.py` 的任何代码/配置**，只读取它写出的文件。
+一个独立的网页服务，用来浏览 `output/osd_error.txt` 里的异常检测结果。
+检测文件仍然只读；人工确认结果和日报状态保存在 `state/dashboard.db`。
+**不修改 `osd20` 服务或 `scripts/evo_osd_monitor.py` 的任何代码/配置**。
 
 ## 启动
 
@@ -144,6 +145,12 @@ docker compose up -d --force-recreate osd-dashboard-public
   - 统计所有 `MISMATCH` 记录，按通道编码聚合；
   - 提供「设备名称 / 通道编码」切换：默认只显示设备名称柱状图，切换后只显示
     通道编码柱状图；统计逻辑和计数不变；
+  - 鼠标移到柱子上时柱子会轻微放大，并显示竖向排列的设备名称、通道编码和
+    串流次数；鼠标移开后恢复，打开大图并缩放后同样有效；
+  - 坐标轴刻度和柱顶数字已放大，柱顶数字会随柱子一起放大，且数字与柱顶之间
+    的间距按相同比例缩放；
+  - 界面英文和数字使用 Inter，编码/等宽类数字使用 JetBrains Mono（与 Orca
+    文档一致，字体已随看板本地托管）；
   - 横纵坐标标题已放大；
   - 点击图表打开大图，支持 +/−、重置、Ctrl/⌘+滚轮和双指捏合缩放；
     大图在 100% 时每 4 个显示一个标签，放大到 150% 时显示全部 50 个标签。
@@ -158,12 +165,26 @@ docker compose up -d --force-recreate osd-dashboard-public
   的日期。归档本身没有轮次标记，页面会用 `output/osd_rounds.csv` 推断轮次边界
   （每个通道序号在一轮里只出现一次，重复出现即视为下一轮），推断结果会标
   「轮次推断」。
-- **通道编码搜索**：仅当天可用，子串匹配 `channelCode`。切到历史日期后搜索框
-  会禁用，后端也会拒绝历史日期的搜索请求。
+- **人工确认**：每条当天 `MISMATCH` 记录右侧有「确认 / 误报」两项；确认
+  表示真实串流，误报表示算法误判。未确认的行不会进入轮次 CSV 和日报统计。
+  确认只允许当天，历史日期只读显示已保存的确认结果。
+- **自动延续确认**：如果同一通道编码在**紧邻的上一轮**已确认为真实串流，
+  下一轮又出现 `MISMATCH`，系统会自动把下一轮也标为“确认”，并显示「自动」
+  标记，不需要人工再点。上一轮是误报或未确认时不会自动延续。
+- **修改确认后的链**：人工修改某条确认（例如从确认改成误报）后，系统会删除
+  该通道之后自动生成的确认，再按新的确认状态重新计算，避免沿用错误结论。
+- **轮次 CSV**：每个轮次标题右侧有「下载 CSV」，只导出已人工确认的行
+  （确认 + 误报），包含确认结果和确认时间；未确认行会被忽略。
+- **串流日报**：只在该日期所有轮次结束后生成；置顶在结果列表上方。
+  日报包含人工确认准确率、每个通道编码/通道名称的今日真实串流次数、前日对比、
+  今日/前日真实串流的检测值及相同检测值，以及停止和重新串流时间。
+  日报可下载为 TXT。
+- **通道名称搜索**：仅当天可用，子串匹配 `name`（通道名称，不区分大小写）。
+  切到历史日期后搜索框会禁用，后端也会拒绝历史日期的搜索请求。
 - **底部分页**：默认每页 50 条，可选 20/50/100；分页栏在结果列表最底部，
   支持首页/上一页/页码/下一页/末页。
 - **可分享 URL**：支持 `?date=2026-10-21&page=2`（历史日期）和
-  `?q=1000304`（当天通道搜索）。页面上的操作会自动更新地址栏。
+  `?q=2341_1`（当天通道名称搜索）。页面上的操作会自动更新地址栏。
 - **自动刷新**：无。需要最新数据时点右上角「刷新」。
 
 ## 数据来源
@@ -175,6 +196,7 @@ docker compose up -d --force-recreate osd-dashboard-public
 | 轮次推断 | `output/osd_rounds.csv` | 给历史归档记录分组（可选） |
 | 通道/设备表 | `out/channels.csv` | 柱状图：通道编码 → 设备名称 |
 | 异常抓帧 | `snapshots/osd_error/round_<N>_<时间>/<index>_<code>.jpg` | 当天表格「查看图片」 |
+| 人工确认 | `state/dashboard.db` | 确认结果、日报审计 |
 
 柱状图统计规则：
 
@@ -183,7 +205,8 @@ docker compose up -d --force-recreate osd-dashboard-public
   通道编码。两种展示使用完全相同的柱子和计数。
 - `STREAM_TOP_N` 控制返回的 Top N（默认 50）。
 
-所有文件都以只读方式挂载。看板不会写入、删除或轮转任何检测数据。
+检测文件以只读方式挂载；只有 `state/` 目录可写，用来保存人工确认状态。
+看板不会写入、删除或轮转任何检测数据。
 
 ## 可调参数
 
@@ -197,6 +220,7 @@ docker compose up -d --force-recreate osd-dashboard-public
 | `compose.yaml` | `HISTORY_ROUNDS` | `1` | 是否用 `osd_rounds.csv` 推断历史轮次；`0` 关闭 |
 | `compose.yaml` | `DASHBOARD_PAGE_SIZE` | `50` | 默认每页条数 |
 | `compose.yaml` | `STREAM_TOP_N` | `50` | 柱状图 Top N |
+| `compose.yaml` | `CONFIRM_DB` | `/state/dashboard.db` | 人工确认 SQLite 路径 |
 
 改完后重新执行：
 
@@ -209,12 +233,14 @@ docker compose up -d --build osd-dashboard osd-dashboard-public
 ```text
 dashboard/
 ├── main.py            FastAPI 路由 + 登录会话 + 静态页面
-├── data.py            文件解析、轮次分组、分页（仅标准库）
+├── data.py            文件解析、轮次分组、日报、CSV、分页
+├── confirmations.py   人工确认 SQLite 存储（仅标准库）
 ├── static/
 │   ├── index.html
 │   ├── login.html     公网实例的登录页
 │   ├── app.css
-│   └── app.js
+│   ├── app.js
+│   └── fonts/         Inter / JetBrains Mono 可变字体（本地托管）
 ├── Dockerfile
 ├── requirements.txt
 └── README.md
@@ -223,8 +249,16 @@ dashboard/
 ## 接口（Demo 自用）
 
 - `GET /api/dashboard/dates`：有数据的日期列表和当天记录数。
-- `GET /api/dashboard/results?date=YYYY-MM-DD&page=1&page_size=50&channel_code=...`
-  ：分页结果，按轮次分组返回。`channel_code` 只允许 `date` 等于今天。
+- `GET /api/dashboard/results?date=YYYY-MM-DD&page=1&page_size=50&channel_name=...`
+  ：分页结果，按轮次分组返回。`channel_name` 只允许 `date` 等于今天。
+- `POST /api/dashboard/confirmations`：请求体
+  `{"row_key": "...", "result": "confirmed|false_positive"}`；
+  只能确认当天 `MISMATCH` 行；`result=null` 可清除确认。
+- `GET /api/dashboard/report?date=YYYY-MM-DD`：已完成日期的日报数据；
+  当天返回 `available=false`。
+- `GET /api/dashboard/report.txt?date=YYYY-MM-DD`：下载日报 TXT。
+- `GET /api/dashboard/round.csv?date=YYYY-MM-DD&round_key=...`：
+  下载单轮 CSV，只包含已人工确认的行。
 - `GET /api/dashboard/frame?index=...&channel_code=...&frame_dir=round_...`
   ：返回该轮该通道的异常抓帧图片；`frame_dir` 可省略，兼容旧的平铺图片。
 - `GET /health`：健康检查。
@@ -251,6 +285,21 @@ dashboard/
 - 变更前遗留的平铺 `<index>_<code>.jpg` 不参与轮次目录清理；确认没有旧页面
   依赖后可以手动删除以节省磁盘。
 - 历史归档由 `osd-error-prune` 跨天生成，所以只能查询已经有归档文件的日期。
+- 日报只在日期结束后生成；当天页面显示“当天所有轮次尚未结束”，不提前统计。
+- 日报的“人工确认准确率” = 确认真实串流数 / 已确认总数（确认 + 误报）；
+  未确认行不计入。
+- 日报的“检测值”来自对应异常行的 `识别` 值；今日/前日同一通道的检测值会分别
+  列出，并给出两边都出现的相同检测值，方便判断是否串到同一个视频流。
+- 停止/重新串流按连续 3 个已完成轮次没有确认串流判定；停止时间取最后一条
+  确认串流时间，重新串流时间取下一条确认串流时间。
+- 轮次 CSV 只包含已确认行（确认和误报都算已确认）；未确认行不会导出。
+- 确认只允许当天修改；历史日期显示已保存结果，页面只读。
+- 自动延续只认“紧邻的上一轮”；中间隔了正常轮次或误报轮次就不会自动确认。
+- 自动延续依赖 `output/osd_rounds.csv` 的轮次顺序；该文件缺失或 `HISTORY_ROUNDS=0`
+  时不会自动确认。
+- `state/dashboard.db` 保存人工确认、自动确认和审计记录。`state/` 是宿主机
+  持久化挂载，重建看板容器不会删除；请勿执行 `docker compose down -v` 或手动
+  删除该目录，建议定期备份。删除后不会影响检测数据，但会丢失所有确认信息。
 
 查看 Funnel 状态：
 tailscale funnel status

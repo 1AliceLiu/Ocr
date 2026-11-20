@@ -1,20 +1,20 @@
-"""Every day at 06:30 (Beijing): refresh out/streams.txt, then restart osd20.
+"""Daily refresh for the old OSD platform and the HK03 platform.
 
-`evo_osd_monitor.py` reads the channel list once at startup, so a new
-streams.txt only takes effect after the monitor process restarts. This service
-does both steps:
+Old platform (default 06:30):
+  pull out/streams.txt, out/devices.csv and out/channels.csv, then restart
+  osd20 so the monitor reads the new list.
 
-  1. pull a fresh list with `evo_pull.py --with-streams --stream-mode template`
-     into a temporary directory;
-  2. sanity-check it (row count, not much smaller than the current file) and
-     atomically replace out/streams.txt, out/devices.csv and out/channels.csv
-     (a failed pull keeps the old files);
-  3. restart the osd20 container through the Docker API, so the next round uses
-     the new list. No `docker` CLI is needed, only /var/run/docker.sock.
+HK03 platform (default 06:00):
+  pull out-hk03/streams.txt, out-hk03/devices.csv and out-hk03/channels.csv.
+  No restart is needed; also drop HK03 frames captured on earlier dates.
+
+Both jobs run in the same osd-daily container. A failed pull keeps the
+current files.
 
 Usage:
-    python scripts/daily_refresh.py --watch          # daily at 06:30
-    python scripts/daily_refresh.py --once           # refresh right now
+    python scripts/daily_refresh.py --watch          # old 06:30 + HK03 06:00
+    python scripts/daily_refresh.py --once           # old platform now
+    python scripts/daily_refresh.py --once-hk03      # HK03 now
     python scripts/daily_refresh.py --once --dry-run # pull + validate only
     python scripts/daily_refresh.py --once --no-restart
 """
@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -41,6 +42,9 @@ STREAMS_NAME = "streams.txt"
 EXTRA_FILES = ("devices.csv", "channels.csv")
 DEFAULT_OSD_ERROR = PROJECT_ROOT / "output" / "osd_error.txt"
 DEFAULT_ARCHIVE_DIR = PROJECT_ROOT / "Logs"
+HK03_FILES = ("streams.txt", "devices.csv", "channels.csv")
+SNAPSHOT_DIR = PROJECT_ROOT / "snapshots" / "osd_error"
+SOURCE_FRAME_DIR = PROJECT_ROOT / "temp" / "hk03" / "frames"
 
 
 def now_beijing() -> datetime:
@@ -77,6 +81,104 @@ def atomic_replace(fresh: Path, target: Path) -> None:
     tmp_target = target.with_name(target.name + ".tmp")
     shutil.copyfile(fresh, tmp_target)
     os.replace(tmp_target, target)
+
+
+def run_hk03_pull(outdir: Path, args) -> int:
+    cmd = [
+        sys.executable, str(PROJECT_ROOT / "scripts" / "evo_pull.py"),
+        "--base", args.hk03_base, "--user", args.hk03_user,
+        "--password", args.hk03_password, "--outdir", str(outdir),
+        "--with-streams", "--stream-mode", "template", "--delay", "0.05",
+    ]
+    log(f"hk03 pull: {args.hk03_base} -> {outdir}")
+    return subprocess.run(cmd).returncode
+
+
+def cleanup_old_hk03_frames(today: str) -> int:
+    """Drop HK03 frames from earlier dates; old-platform frames are pruned
+    separately by osd-error-prune."""
+    deleted = 0
+    if SNAPSHOT_DIR.is_dir():
+        for folder in SNAPSHOT_DIR.glob("round_*"):
+            if not folder.is_dir():
+                continue
+            match = re.match(r"round_\d+_(\d{8})_\d{6}$", folder.name)
+            folder_date = match.group(1) if match else ""
+            for path in folder.glob("hk03_*.jpg"):
+                try:
+                    captured = datetime.fromtimestamp(
+                        path.stat().st_mtime, BEIJING_TZ).strftime("%Y-%m-%d")
+                    if captured >= today:
+                        continue
+                    path.unlink()
+                    deleted += 1
+                except OSError:
+                    continue
+            try:
+                # Keep today's empty folder; it is the current round.
+                if (folder_date and folder_date < today.replace("-", "")
+                        and not any(folder.iterdir())):
+                    folder.rmdir()
+            except OSError:
+                pass
+    if SOURCE_FRAME_DIR.is_dir():
+        for path in SOURCE_FRAME_DIR.glob("*.jpg"):
+            try:
+                captured = datetime.fromtimestamp(
+                    path.stat().st_mtime, BEIJING_TZ).strftime("%Y-%m-%d")
+                if captured < today:
+                    path.unlink()
+                    deleted += 1
+            except OSError:
+                continue
+    return deleted
+
+
+def refresh_hk03(args) -> bool:
+    target_dir = Path(args.hk03_outdir)
+    target = target_dir / STREAMS_NAME
+    staging = Path(tempfile.mkdtemp(prefix="hk03-refresh-"))
+    try:
+        rc = run_hk03_pull(staging, args)
+        fresh = staging / STREAMS_NAME
+        if rc != 0 or not fresh.exists():
+            log(f"HK03 pull failed (rc={rc}); keeping current {target}")
+            return False
+        new_rows = count_rows(fresh)
+        old_rows = count_rows(target)
+        log(f"HK03 rows: new={new_rows} current={old_rows}")
+        if new_rows < args.min_rows:
+            log(f"HK03 refusing: fewer than --min-rows={args.min_rows}")
+            return False
+        if old_rows and new_rows < old_rows * args.min_ratio:
+            log(f"HK03 refusing: new list is smaller than "
+                f"{args.min_ratio:.0%} of the current one")
+            return False
+        if args.dry_run:
+            log(f"HK03 dry-run: would replace {target} and update "
+                f"{', '.join(HK03_FILES[1:])}")
+            return True
+
+        for name in HK03_FILES:
+            fresh_file = staging / name
+            if not fresh_file.exists() or fresh_file.stat().st_size == 0:
+                log(f"HK03 missing or empty {name}; keeping current file")
+                continue
+            target_file = target_dir / name
+            try:
+                atomic_replace(fresh_file, target_file)
+            except OSError as exc:
+                log(f"HK03 replace {target_file} failed: "
+                    f"{type(exc).__name__}: {exc}")
+                continue
+            log(f"HK03 replaced {target_file}")
+        removed = cleanup_old_hk03_frames(
+            now_beijing().strftime("%Y-%m-%d"))
+        if removed:
+            log(f"HK03 removed {removed} frames from previous dates")
+        return True
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +262,60 @@ def restart_service(sock_path: str, service: str, wait_seconds: int = 10) -> boo
     log(f"docker: restart failed HTTP {status}: "
         f"{(payload or b'').decode('utf-8', 'replace')[:200]}")
     return False
+
+
+def stop_service(sock_path: str, service: str, wait_seconds: int = 10) -> bool:
+    container_id = find_service_container(sock_path, service)
+    if not container_id:
+        log(f"docker: no running container for service {service!r}")
+        return False
+    status, payload = docker_request(
+        sock_path, "POST",
+        f"/containers/{container_id}/stop?t={wait_seconds}")
+    if status in (204, 304):
+        log(f"docker: stopped {service} ({container_id[:12]})")
+        return True
+    log(f"docker: stop failed HTTP {status}: "
+        f"{(payload or b'').decode('utf-8', 'replace')[:200]}")
+    return False
+
+
+def start_service(sock_path: str, service: str) -> bool:
+    container_id = find_service_container(sock_path, service)
+    if not container_id:
+        log(f"docker: no container for service {service!r}")
+        return False
+    status, payload = docker_request(
+        sock_path, "POST", f"/containers/{container_id}/start")
+    if status in (204, 304):
+        log(f"docker: started {service} ({container_id[:12]})")
+        return True
+    log(f"docker: start failed HTTP {status}: "
+        f"{(payload or b'').decode('utf-8', 'replace')[:200]}")
+    return False
+
+
+def run_hk03_suppress(args, action: str) -> bool:
+    if action == "check":
+        table = Path(args.hk03_outdir) / "channels.csv"
+        try:
+            table_date = datetime.fromtimestamp(
+                table.stat().st_mtime, BEIJING_TZ).strftime("%Y-%m-%d")
+        except OSError:
+            table_date = ""
+        if table_date != now_beijing().strftime("%Y-%m-%d"):
+            log(f"HK03 suppression: {table} was not refreshed today; skipped")
+            return False
+    cmd = [
+        sys.executable,
+        str(PROJECT_ROOT / "scripts" / "daily_hk03_suppress.py"),
+        action,
+        "--base", args.hk03_base,
+        "--user", args.hk03_user,
+        "--password", args.hk03_password,
+    ]
+    log(f"HK03 suppression: {action}")
+    return subprocess.run(cmd).returncode == 0
 
 
 # --------------------------------------------------------------------------
@@ -256,6 +412,23 @@ def refresh(args) -> bool:
     if ok and args.restart:
         if args.dry_run:
             log("dry-run: would restart osd20")
+        elif args.hk03_suppress and not args.no_hk03:
+            # The check runs while osd20 is still alive (it only reads the
+            # tables).  Stop it briefly only to rewrite osd_error.txt safely.
+            check_ok = run_hk03_suppress(args, "check")
+            if not check_ok:
+                log("HK03 suppression check failed; restarting osd20 without applying")
+                restart_service(args.docker_sock, args.service)
+                return True
+            stopped = stop_service(args.docker_sock, args.service)
+            try:
+                if stopped:
+                    run_hk03_suppress(args, "apply")
+                else:
+                    log("HK03 suppression: osd20 stop failed; apply skipped")
+            finally:
+                if stopped:
+                    start_service(args.docker_sock, args.service)
         else:
             restart_service(args.docker_sock, args.service)
     return ok
@@ -272,11 +445,21 @@ def seconds_until(hhmm: str) -> float:
 
 def watch(args) -> None:
     while True:
-        wait = seconds_until(args.time)
-        log(f"next refresh at {args.time} Beijing (in {wait / 3600:.2f} h)")
+        events = [("old", seconds_until(args.time))]
+        if not args.no_hk03:
+            events.append(("hk03", seconds_until(args.hk03_time)))
+        events.sort(key=lambda item: item[1])
+        kind, wait = events[0]
+        if (len(events) > 1 and abs(events[0][1] - events[1][1]) < 1):
+            kind = "both"
+        log(f"next refresh: {kind} (old {args.time}, HK03 "
+            f"{args.hk03_time}) in {wait / 3600:.2f} h")
         time.sleep(wait)
         try:
-            refresh(args)
+            if kind in ("hk03", "both"):
+                refresh_hk03(args)
+            if kind in ("old", "both"):
+                refresh(args)
         except Exception as exc:  # one bad run must not kill the schedule
             log(f"refresh failed: {type(exc).__name__}: {exc}")
         time.sleep(60)  # avoid firing twice within the same minute
@@ -288,7 +471,23 @@ def main() -> None:
     parser.add_argument("--outdir", default=os.getenv("STREAMS_DIR", "/work/out"),
                         help="directory holding streams.txt (default /work/out)")
     parser.add_argument("--time", default="06:30",
-                        help="daily refresh time, Beijing (default 06:30)")
+                        help="old platform refresh time, Beijing (default 06:30)")
+    parser.add_argument("--hk03-outdir",
+                        default=os.getenv("HK03_OUTDIR", "/work/out-hk03"),
+                        help="HK03 directory (default /work/out-hk03)")
+    parser.add_argument("--hk03-time",
+                        default=os.getenv("HK03_REFRESH_TIME", "06:00"),
+                        help="HK03 refresh time, Beijing (default 06:00)")
+    parser.add_argument("--hk03-base",
+                        default=os.getenv("HK03_BASE", ""),
+                        help="HK03 platform base URL (or HK03_BASE)")
+    parser.add_argument("--hk03-user", default=os.getenv("HK03_USER", ""))
+    parser.add_argument("--hk03-password", default=os.getenv("HK03_PASSWORD", ""),
+                        help="prefer HK03_PASSWORD in the environment")
+    parser.add_argument("--no-hk03", action="store_true",
+                        help="disable the HK03 job in --watch mode")
+    parser.add_argument("--once-hk03", action="store_true",
+                        help="refresh HK03 now and exit")
     parser.add_argument("--watch", action="store_true",
                         help="run forever, refresh once a day at --time")
     parser.add_argument("--once", action="store_true",
@@ -297,6 +496,8 @@ def main() -> None:
                         help="pull and validate, but do not replace/restart")
     parser.add_argument("--no-restart", action="store_true",
                         help="update streams.txt only, leave osd20 alone")
+    parser.add_argument("--no-hk03-suppress", action="store_true",
+                        help="skip the daily old/HK03 intersection suppression job")
     parser.add_argument("--min-rows", type=int, default=100,
                         help="refuse a list with fewer rows (default 100)")
     parser.add_argument("--min-ratio", type=float, default=0.5,
@@ -317,12 +518,17 @@ def main() -> None:
 
     args.restart = not args.no_restart
     args.archive = not args.no_archive
+    args.hk03_suppress = not args.no_hk03_suppress
     try:
-        hour, minute = (int(part) for part in args.time.split(":"))
-        assert 0 <= hour < 24 and 0 <= minute < 60
+        for value in ((args.time,) if args.no_hk03
+                      else (args.time, args.hk03_time)):
+            hour, minute = (int(part) for part in value.split(":"))
+            assert 0 <= hour < 24 and 0 <= minute < 60
     except (ValueError, AssertionError):
-        parser.error("--time must be HH:MM")
+        parser.error("--time/--hk03-time must be HH:MM")
 
+    if args.once_hk03:
+        sys.exit(0 if refresh_hk03(args) else 1)
     if args.watch:
         watch(args)
         return

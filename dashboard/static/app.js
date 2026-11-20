@@ -88,6 +88,8 @@
     chartModalBaseHeight: 400,
     chartLastFocus: null,
     imageOpen: false,
+    imageLive: false,
+    liveRow: null,
     imageZoom: 1,
     imageBaseWidth: 0,
     imageBaseHeight: 0,
@@ -362,6 +364,18 @@
     els.imageZoomReset.addEventListener("click", () => setImageZoom(1));
     els.imagePreview.addEventListener("load", fitImageToViewport);
     els.imagePreview.addEventListener("error", () => {
+      els.imageError.replaceChildren();
+      if (state.imageLive) {
+        els.imageError.append("实时预览失败（通道离线、取流失败，或同时预览人数已满） ");
+        const retry = element("button", "rtsp-btn", "重试");
+        retry.type = "button";
+        retry.addEventListener("click", () => {
+          if (state.liveRow) openLiveModal(state.liveRow);
+        });
+        els.imageError.append(retry);
+      } else {
+        els.imageError.textContent = "图片加载失败或已不存在";
+      }
       els.imageError.classList.remove("hidden");
       els.imagePreview.classList.add("hidden");
       els.imageZoomLabel.textContent = "—";
@@ -989,36 +1003,61 @@
     return `/api/dashboard/frame?${params.toString()}`;
   }
 
-  function openImageModal(row) {
-    if (!row || !row.hasImage || row.index === null || row.index === undefined) {
+  function newFrameUrl(row) {
+    const params = new URLSearchParams({
+      index: String(row.index),
+      channel_code: row.channelCode || "",
+      t: String(Date.now()),
+    });
+    if (row.frameDir) params.set("frame_dir", row.frameDir);
+    return `/api/dashboard/new-frame?${params.toString()}`;
+  }
+
+  function openImageModal(row, source = "old") {
+    const isNew = source === "new";
+    if (!row || row.index === null || row.index === undefined
+        || (isNew ? !row.hasNewImage : !row.hasImage)) {
       return;
     }
     if (state.chartModalOpen) closeChartModal();
     state.imageLastFocus = document.activeElement;
     state.imageOpen = true;
+    state.imageLive = false;
+    state.liveRow = null;
     state.imageZoom = 1;
     state.imageBaseWidth = 0;
     state.imageBaseHeight = 0;
-    els.imageModalTitle.textContent = `抓帧图片 · ${row.name || row.channelCode}`;
-    els.imageModalSubtitle.textContent =
-      `${row.time} · 通道 ${row.channelCode} · 期望 ${row.expected || "—"} → 识别 ${row.detected || "—"} · ${row.status} · 本轮异常抓帧`;
+    els.imageModalTitle.textContent =
+      `${isNew ? "新平台抓帧" : "抓帧图片"} · ${row.name || row.channelCode}`;
+    els.imageModalSubtitle.textContent = isNew
+      ? `${row.time} · 通道 ${row.channelCode} · 新平台视频帧`
+      : `${row.time} · 通道 ${row.channelCode} · 期望 ${row.expected || "—"} → 识别 ${row.detected || "—"} · ${row.status} · 本轮异常抓帧`;
     els.imageError.classList.add("hidden");
-    els.imagePreview.classList.remove("hidden");
-    els.imagePreview.alt = `通道 ${row.channelCode} 抓帧图片`;
+    els.imageError.textContent = "图片加载失败或已不存在";
+    els.imagePreview.classList.remove("hidden", "is-live");
+    els.imagePreview.style.width = "";
+    els.imagePreview.style.height = "";
+    els.imagePreview.alt =
+      `通道 ${row.channelCode} ${isNew ? "新平台" : "旧平台"}抓帧图片`;
     els.imagePreview.removeAttribute("src");
     els.imageModal.classList.remove("hidden");
     document.body.classList.add("chart-modal-open");
-    els.imagePreview.src = frameUrl(row);
+    els.imagePreview.src = isNew ? newFrameUrl(row) : frameUrl(row);
     requestAnimationFrame(() => els.imageClose.focus());
   }
 
   function closeImageModal() {
     if (!state.imageOpen) return;
     state.imageOpen = false;
+    state.imageLive = false;
+    state.liveRow = null;
     state.imageBaseWidth = 0;
     state.imageBaseHeight = 0;
     els.imageModal.classList.add("hidden");
+    els.imagePreview.classList.remove("is-live");
     els.imagePreview.removeAttribute("src");
+    els.imagePreview.style.width = "";
+    els.imagePreview.style.height = "";
     els.imageError.classList.add("hidden");
     document.body.classList.remove("chart-modal-open");
     if (state.imageLastFocus && typeof state.imageLastFocus.focus === "function") {
@@ -1102,8 +1141,12 @@
     }
 
     if (data.inProgress && data.isToday) {
+      const p = data.inProgress;
+      const progress = Number.isFinite(p.processed)
+        ? `已处理 ${p.processed} 路（OK ${p.ok || 0}，取流超时 ${p.timeouts || 0}），`
+        : "";
       messages.push(
-        `最新轮次 #${data.inProgress.number} 仍在进行中，已记录 ${data.inProgress.rowCount} 条异常。`
+        `最新轮次 #${p.number} 仍在进行中，${progress}已记录 ${p.rowCount} 条异常。`
       );
     }
 
@@ -1309,12 +1352,15 @@
       ["col-index", "编号"],
       ["col-code", "通道编码"],
       ["col-name", "通道名称"],
+      ["col-project", "项目"],
       ["col-expected", "期望"],
       ["col-detected", "识别"],
       ["col-confidence", "置信度"],
       ["col-status", "状态"],
       ["col-sample", "样例"],
+      ...(data.rtspEnabled ? [["col-rtsp", "预览"]] : []),
       ["col-confirm", "确认"],
+      ["col-spacer", ""],
     ];
     for (const [className, label] of columns) {
       const th = element("th", className, label);
@@ -1352,6 +1398,11 @@
     name.title = row.name || "";
     tr.append(name);
 
+    const project = element("td", "cell-project", row.project || "—");
+    project.title = row.projectPath || row.project || "";
+    if (!row.project) project.classList.add("is-empty");
+    tr.append(project);
+
     tr.append(element("td", "cell-expected", row.expected || "—"));
 
     const detected = element("td", "cell-detected", row.detected || "—");
@@ -1362,28 +1413,92 @@
     tr.append(buildConfidenceCell(row.confidence));
     tr.append(buildStatusCell(row.status));
     tr.append(buildSampleCell(row, data));
+    if (data.rtspEnabled) tr.append(buildRtspCell(row));
     tr.append(buildConfirmCell(row, data));
+    tr.append(element("td", "cell-spacer", ""));
     return tr;
+  }
+
+  function buildRtspCell(row) {
+    const td = element("td", "cell-rtsp");
+    if (!row.channelCode) {
+      td.append(element("span", "confirm-empty", "—"));
+      return td;
+    }
+    const btn = element("button", "rtsp-btn", "预览");
+    btn.type = "button";
+    btn.title = "打开实时预览（子码流约 1 秒延迟，关闭窗口即停止取流）";
+    btn.addEventListener("click", () => openLiveModal(row));
+    td.append(btn);
+    return td;
+  }
+
+  function openLiveModal(row) {
+    if (!row || !row.channelCode) return;
+    if (state.chartModalOpen) closeChartModal();
+    state.imageLastFocus = document.activeElement;
+    state.imageOpen = true;
+    state.imageLive = true;
+    state.liveRow = row;
+    state.imageZoom = 1;
+    state.imageBaseWidth = 0;
+    state.imageBaseHeight = 0;
+    els.imageModalTitle.textContent = `实时预览 · ${row.name || row.channelCode}`;
+    els.imageModalSubtitle.textContent =
+      `${row.time} · 通道 ${row.channelCode} · 子码流预览，关闭窗口即停止取流`;
+    els.imageError.textContent = "正在连接实时流…";
+    els.imageError.classList.remove("hidden");
+    els.imagePreview.classList.remove("hidden");
+    els.imagePreview.classList.add("is-live");
+    els.imagePreview.style.width = "";
+    els.imagePreview.style.height = "";
+    els.imagePreview.alt = `通道 ${row.channelCode} 实时预览`;
+    els.imagePreview.removeAttribute("src");
+    els.imageModal.classList.remove("hidden");
+    document.body.classList.add("chart-modal-open");
+    const params = new URLSearchParams({
+      channel_code: row.channelCode,
+      t: String(Date.now()),
+    });
+    els.imagePreview.src = `/api/dashboard/preview?${params.toString()}`;
+    requestAnimationFrame(() => els.imageClose.focus());
   }
 
   function buildSampleCell(row, data) {
     const td = document.createElement("td");
     td.className = "cell-sample";
-    if (data.isToday && row.hasImage) {
-      const button = element("button", "sample-link", "查看图片");
-      button.type = "button";
-      button.title = "查看该通道本轮异常抓帧";
-      button.addEventListener("click", () => openImageModal(row));
-      td.append(button);
-    } else {
+    const isMismatch = (row.status || "").toUpperCase().startsWith("MISMATCH");
+    if (!data.isToday || !isMismatch) {
       const empty = element("span", "sample-empty", "—");
-      if (!data.isToday) {
-        empty.title = "历史归档不保存图片";
-      } else if ((row.status || "").toUpperCase().startsWith("MISMATCH")) {
-        empty.title = "该通道没有可用的抓帧图片";
-      }
+      if (!data.isToday) empty.title = "历史归档不保存图片";
       td.append(empty);
+      return td;
     }
+
+    const pair = element("span", "sample-pair");
+    if (row.hasImage) {
+      const button = element("button", "sample-link", "旧");
+      button.type = "button";
+      button.title = "查看旧平台本轮异常抓帧";
+      button.addEventListener("click", () => openImageModal(row, "old"));
+      pair.append(button);
+    } else {
+      const missing = element("span", "sample-missing", "旧（无）");
+      missing.title = "该通道没有旧平台抓帧图片";
+      pair.append(missing);
+    }
+    if (row.hasNewImage) {
+      const button = element("button", "sample-link", "新");
+      button.type = "button";
+      button.title = "查看新平台该设备抓帧";
+      button.addEventListener("click", () => openImageModal(row, "new"));
+      pair.append(button);
+    } else {
+      const missing = element("span", "sample-missing", "新（无）");
+      missing.title = "新平台没有同名通道，或该通道没有抓到可用画面";
+      pair.append(missing);
+    }
+    td.append(pair);
     return td;
   }
 

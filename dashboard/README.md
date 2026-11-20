@@ -155,9 +155,12 @@ docker compose up -d --force-recreate osd-dashboard-public
   - 点击图表打开大图，支持 +/−、重置、Ctrl/⌘+滚轮和双指捏合缩放；
     大图在 100% 时每 4 个显示一个标签，放大到 150% 时显示全部 50 个标签。
 - **表格「样例」列**：当天的 `MISMATCH` 记录如果存在抓帧图片，会显示
-  「查看图片」链接；点击后可查看大图并缩放。图片按轮次保存在
-  `snapshots/osd_error/round_<N>_<时间>/`；历史归档不保存图片，因此历史
-  日期的样例列为空。
+  「旧」链接；如果同一通道有 HK03 新平台帧，会并列显示「新」链接。点击后
+  可查看大图并缩放。旧平台图片按轮次保存在
+  `snapshots/osd_error/round_<N>_<时间>/`，新平台帧放在同一轮次目录，文件名
+  加 `hk03_` 前缀；新平台只展示图片，不展示其 OCR 结果。当天 `MISMATCH`
+  行固定显示“旧 / 新”两个位置，没有新平台帧时显示“新（无）”。历史归档
+  不保存图片，因此历史日期的样例列为空。
 - **按轮次分隔**：文件里的 `# round N <time>` / `# round N done:` 会解析成
   独立的轮次卡片，每轮之间有明显的间隔和汇总信息（正常数、异常数、取流超时、
   耗时）。跨午夜的轮次会标「跨天」。
@@ -195,7 +198,8 @@ docker compose up -d --force-recreate osd-dashboard-public
 | 历史归档 | `Logs/*_osd_error.csv` | 历史日期查询 |
 | 轮次推断 | `output/osd_rounds.csv` | 给历史归档记录分组（可选） |
 | 通道/设备表 | `out/channels.csv` | 柱状图：通道编码 → 设备名称 |
-| 异常抓帧 | `snapshots/osd_error/round_<N>_<时间>/<index>_<code>.jpg` | 当天表格「查看图片」 |
+| 异常抓帧 | `snapshots/osd_error/round_<N>_<时间>/<index>_<code>.jpg` | 当天表格「旧」 |
+| HK03 新平台帧 | `snapshots/osd_error/round_<N>_<时间>/hk03_<index>_<code>.jpg` | 当天表格「新」 |
 | 人工确认 | `state/dashboard.db` | 确认结果、日报审计 |
 
 柱状图统计规则：

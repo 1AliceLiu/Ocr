@@ -92,6 +92,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from evo_pull import START_VIDEO, STOP_VIDEO, Platform, is_ok, pick_rtsp  # noqa: E402
 from evo_snapshot import read_channels, safe_name  # noqa: E402
+from channel_filter import (  # noqa: E402
+    DEFAULT_BLOCKED_FILE,
+    is_blocked,
+    load_blocked_prefixes,
+)
 from osd_ocr import (  # noqa: E402
     ALLOW_ALNUM,
     ALLOW_DIGITS,
@@ -108,6 +113,8 @@ from osd_digits import (  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROFILE_PATH = PROJECT_ROOT / "config" / "osd_profiles.json"
+DEFAULT_SUPPRESS_FILE = PROJECT_ROOT / "state" / "hk03_cancelled.json"
+DEFAULT_CHANNELS_FILE = PROJECT_ROOT / "out" / "channels.csv"
 
 # Bottom-left OSD ROI for a 1920x1080 frame: (x1, y1, x2, y2).
 X1, Y1, X2, Y2 = 43, 971, 219, 1040
@@ -137,6 +144,34 @@ def now_beijing() -> datetime:
     return datetime.now(BEIJING_TZ)
 
 
+def load_suppressed(path: Path) -> dict[str, set[str]]:
+    """Channels whose known crossover was cancelled by HK03 for today."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if data.get("date") != now_beijing().strftime("%Y-%m-%d"):
+        return {}
+    out: dict[str, set[str]] = {}
+    for code, values in (data.get("channels") or {}).items():
+        if isinstance(values, str):
+            values = [values]
+        out[str(code)] = {str(value) for value in values if str(value)}
+    return out
+
+
+def is_suppressed(result: dict, suppressed: dict[str, set[str]]) -> bool:
+    """Hide logged anomalies for channels whose crossover was cancelled.
+
+    The stored OSD values are kept for audit only.  Suppression is per device
+    for the day: the old platform often reads a different wrong value on the
+    next round, which must not re-open an alert HK03 already cleared.
+    """
+    return bool(suppressed.get(result.get("channelCode", "")))
+
+
 def expected_code(name: str) -> str:
     """'P40A2-087_1' -> 'P40A2-087'; '2544_1' -> '2544'; 'MB_ZM_DO_CE_0673' -> '0673'."""
     name = name or ""
@@ -149,6 +184,23 @@ def expected_code(name: str) -> str:
         return stem
     match = re.search(r"\d+", stem)
     return match.group(0) if match else stem
+
+
+def load_device_names(path: Path) -> dict[str, str]:
+    """channelCode -> 设备名称 from out/channels.csv (empty when missing)."""
+    if not path.exists():
+        return {}
+    names: dict[str, str] = {}
+    try:
+        with path.open(encoding="utf-8-sig", newline="", errors="replace") as fh:
+            for row in csv.DictReader(fh):
+                code = (row.get("通道编码") or "").strip()
+                name = (row.get("设备名称") or "").strip()
+                if code and name:
+                    names[code] = name
+    except OSError:
+        return {}
+    return names
 
 
 def canonical(text: str) -> str:
@@ -316,6 +368,7 @@ class Monitor:
         self.args = args
         self.api_lock = threading.Lock()
         self.ocr_lock = threading.Lock()
+        self.device_names: dict[str, str] = {}
         self.save_dir = args.save_dir
         self.error_root = args.error_dir
         self.error_dir = None
@@ -574,17 +627,18 @@ class Monitor:
 
     def one(self, channel: dict) -> dict:
         code = channel["channelCode"]
+        expected = (self.device_names.get(code)
+                    or expected_code(channel["name"]))
         result = {
             "index": channel["index"],
             "channelCode": code,
             "name": channel["name"],
-            "expected": expected_code(channel["name"]),
+            "expected": expected,
             "detected": "",
             "confidence": 0.0,
             "status": "CAPTURE_FAILED",
             "time": now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
         }
-        expected = result["expected"]
         profile = self.profile_for(channel, expected)
         expected_len = profile.get("length") or len(expected) or None
         numeric = expected.isdigit()
@@ -811,6 +865,14 @@ def main() -> None:
     parser.add_argument("--token", default="")
     parser.add_argument("--user-id", default="1")
     parser.add_argument("--input", type=Path, default=PROJECT_ROOT / "out" / "streams.txt")
+    parser.add_argument("--channels-file", type=Path,
+                        default=DEFAULT_CHANNELS_FILE,
+                        help="channel table used for 设备名称 (default: "
+                             "out/channels.csv)")
+    parser.add_argument("--blocked-file", type=Path,
+                        default=DEFAULT_BLOCKED_FILE,
+                        help="channel-code prefixes to ignore (default: "
+                             "config/blocked_channels.txt)")
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "output.txt")
     parser.add_argument("--csv", type=Path,
                         default=PROJECT_ROOT / "output" / "osd_rounds.csv")
@@ -862,6 +924,9 @@ def main() -> None:
     parser.add_argument("--osd-profile-file", default=str(DEFAULT_PROFILE_PATH),
                         help="optional per-channel OSD profile JSON "
                              "(roi/type/length/alias); missing file is OK")
+    parser.add_argument("--suppress-file", default=str(DEFAULT_SUPPRESS_FILE),
+                        help="JSON list of today's HK03-cancelled channels; "
+                             "all their logged anomalies are hidden")
     parser.add_argument("--cell-reader", choices=["cells", "legacy"],
                         default="cells",
                         help="cells: row projection + per-cell solid mask + "
@@ -907,6 +972,16 @@ def main() -> None:
         raise SystemExit(f"input not found: {args.input}")
 
     channels = read_channels(args.input)
+    blocked = load_blocked_prefixes(Path(args.blocked_file))
+    if blocked:
+        before = len(channels)
+        channels = [
+            ch for ch in channels
+            if not is_blocked(ch["channelCode"], blocked)
+        ]
+        print(f"blocked: {before - len(channels)} channels "
+              f"({len(blocked)} prefixes) from {args.blocked_file}",
+              flush=True)
     if args.limit:
         channels = channels[:args.limit]
     if not channels:
@@ -926,7 +1001,24 @@ def main() -> None:
           f"profiles: {args.osd_profile_file}", flush=True)
 
     monitor = Monitor(p, reader, args)
-    monitor.expected_codes = {expected_code(ch["name"]) for ch in channels}
+    monitor.device_names = load_device_names(Path(args.channels_file))
+    monitor.expected_codes = {
+        monitor.device_names.get(ch["channelCode"])
+        or expected_code(ch["name"]) for ch in channels
+    }
+    print(f"device names: {len(monitor.device_names)} from "
+          f"{args.channels_file}", flush=True)
+    suppressed = load_suppressed(Path(args.suppress_file))
+    if suppressed:
+        print(f"suppressed: {len(suppressed)} HK03-cancelled channels from "
+              f"{args.suppress_file}", flush=True)
+        before = len(channels)
+        channels = [
+            ch for ch in channels
+            if ch["channelCode"] not in suppressed
+        ]
+        print(f"skipped suppressed: {before - len(channels)} channels "
+              f"({len(channels)} remain)", flush=True)
     csv_path = args.csv
     csv_started = csv_path.exists() and csv_path.stat().st_size > 0
     for path in (args.output, csv_path, args.error_log):
@@ -955,6 +1047,7 @@ def main() -> None:
         logged = 0
         timeouts = 0
         uncertain = 0
+        suppressed_count = 0
         with contextlib.ExitStack() as stack:
             out = stack.enter_context(
                 args.output.open("a", encoding="utf-8", buffering=1))
@@ -980,7 +1073,9 @@ def main() -> None:
                     except Exception as exc:  # one bad stream must not stop others
                         r = {
                             "index": ch["index"], "channelCode": ch["channelCode"],
-                            "name": ch["name"], "expected": expected_code(ch["name"]),
+                            "name": ch["name"],
+                            "expected": (monitor.device_names.get(ch["channelCode"])
+                                         or expected_code(ch["name"])),
                             "detected": "", "confidence": 0.0,
                             "status": f"ERROR({type(exc).__name__})",
                             "time": now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
@@ -998,12 +1093,15 @@ def main() -> None:
                     elif r["status"].startswith("UNCERTAIN"):
                         uncertain += 1
                     elif err_fh and is_logged_anomaly(r["status"]):
-                        logged += 1
-                        # Keep osd_error.txt at the original 8-column schema:
-                        # time index channelCode name expected detected confidence status
-                        err_fh.write(f"{r['time']}\t{r['index']}\t{r['channelCode']}\t"
-                                     f"{r['name']}\t{r['expected']}\t{r['detected']}\t"
-                                     f"{r['confidence']:.3f}\t{r['status']}\n")
+                        if is_suppressed(r, suppressed):
+                            suppressed_count += 1
+                        else:
+                            logged += 1
+                            # Keep osd_error.txt at the original 8-column schema:
+                            # time index channelCode name expected detected confidence status
+                            err_fh.write(f"{r['time']}\t{r['index']}\t{r['channelCode']}\t"
+                                         f"{r['name']}\t{r['expected']}\t{r['detected']}\t"
+                                         f"{r['confidence']:.3f}\t{r['status']}\n")
                     if r["status"] == "OK":
                         ok += 1
                     extra = f" reason={r['reason']}" if r.get("reason") else ""
@@ -1018,9 +1116,13 @@ def main() -> None:
                              f"{time.monotonic() - started:.1f}s\n")
                 if uncertain:
                     err_fh.write(f"# round {round_no} uncertain: {uncertain}\n")
+                if suppressed_count:
+                    err_fh.write(f"# round {round_no} suppressed: "
+                                 f"{suppressed_count}\n")
 
         print(f"round {round_no}: {ok}/{len(results)} OK, {logged} anomaly, "
               f"{timeouts} capture timeout, {uncertain} uncertain, "
+              f"{suppressed_count} suppressed, "
               f"{time.monotonic() - started:.1f}s", flush=True)
 
         if args.once:

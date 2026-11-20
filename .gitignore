@@ -27,4 +27,5 @@ state/
 *.csv
 # All txt files
 *.txt
+!config/blocked_channels.txt
 

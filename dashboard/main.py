@@ -6,17 +6,20 @@ the osd20 container or any of its files.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import html
 import mimetypes
 import os
 import secrets
+import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs
 
+import imageio_ffmpeg
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import (
     FileResponse,
@@ -24,6 +27,7 @@ from fastapi.responses import (
     JSONResponse,
     RedirectResponse,
     Response,
+    StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -40,6 +44,103 @@ SESSION_TTL = max(300, int(os.getenv("DASHBOARD_SESSION_HOURS", "12")) * 3600)
 LOGIN_TEMPLATE = (STATIC_DIR / "login.html").read_text(encoding="utf-8")
 _sessions: dict[str, float] = {}
 _session_lock = threading.Lock()
+
+# Live RTSP: minted on demand from the platform (tokens last ~30s, single use).
+# Enabled only when the platform account is configured for this instance.
+EVO_BASE = os.getenv("EVO_BASE", "")
+EVO_USER = os.getenv("EVO_USER", "")
+EVO_PASSWORD = os.getenv("EVO_PASSWORD", "")
+RTSP_ENABLED = bool(EVO_BASE and EVO_PASSWORD)
+_rtsp_client = None
+_rtsp_lock = threading.Lock()
+PREVIEW_LIMIT = 8
+PREVIEW_WIDTH = max(320, int(os.getenv("PREVIEW_WIDTH", "640")))
+PREVIEW_FPS = max(1, int(os.getenv("PREVIEW_FPS", "6")))
+PREVIEW_QUALITY = min(31, max(2, int(os.getenv("PREVIEW_QUALITY", "7"))))
+_preview_active = 0
+_preview_lock = threading.Lock()
+
+
+def _preview_acquire() -> bool:
+    global _preview_active
+    with _preview_lock:
+        if _preview_active >= PREVIEW_LIMIT:
+            return False
+        _preview_active += 1
+        return True
+
+
+def _preview_release() -> None:
+    global _preview_active
+    with _preview_lock:
+        _preview_active = max(0, _preview_active - 1)
+
+
+def _live_rtsp(channel_code: str, stream_type: str):
+    global _rtsp_client
+    if "/work/scripts" not in sys.path:
+        sys.path.insert(0, "/work/scripts")
+    from evo_pull import START_VIDEO, is_ok, pick_rtsp
+
+    client = _rtsp_login()
+    with _rtsp_lock:
+        body = client.post(START_VIDEO, {"data": {
+            "dataType": "3",
+            "streamType": stream_type,
+            "channelId": channel_code,
+            "urlType": 1,
+            "packtype": "Private",
+            "optModule": "ADMIN_001031",
+        }})
+    data = body.get("data") or {}
+    url = pick_rtsp(data.get("url") or "", data.get("token") or "")
+    if not is_ok(body) or not url:
+        raise RuntimeError(body.get("errMsg") or body.get("desc")
+                           or f"StartVideo code={body.get('code')}")
+    return url, data.get("session")
+
+
+def _stop_stream(channel_code: str, session) -> None:
+    """Release the media session opened for a preview (URL dies with it)."""
+    if not session or _rtsp_client is None:
+        return
+    try:
+        from evo_pull import STOP_VIDEO
+        with _rtsp_lock:
+            _rtsp_client.post(STOP_VIDEO, {"data": {
+                "channelId": channel_code,
+                "session": str(session),
+                "optModule": "ADMIN_001031",
+            }})
+    except Exception:
+        pass
+
+
+def _rtsp_login():
+    global _rtsp_client
+    if "/work/scripts" not in sys.path:
+        sys.path.insert(0, "/work/scripts")
+    from evo_pull import Platform
+
+    with _rtsp_lock:
+        if _rtsp_client is None:
+            client = Platform(EVO_BASE, EVO_USER, EVO_PASSWORD)
+            client.login()
+            _rtsp_client = client
+        return _rtsp_client
+
+
+def _warm_rtsp() -> None:
+    try:
+        _rtsp_login()
+    except Exception:
+        pass  # retried on the first click
+
+
+if RTSP_ENABLED:
+    # First login can take ~30s (endpoint probing); warm it up so the first
+    # click on the page is fast.
+    threading.Thread(target=_warm_rtsp, daemon=True).start()
 
 app = FastAPI(
     title="OSD 检测结果看板（Demo）",
@@ -223,7 +324,7 @@ def results(
             detail="日期格式应为 YYYY-MM-DD") from exc
 
     try:
-        return data.get_results(
+        payload = data.get_results(
             date=chosen,
             page=page,
             page_size=page_size,
@@ -232,6 +333,94 @@ def results(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    payload["rtspEnabled"] = RTSP_ENABLED
+    return payload
+
+
+@app.get("/api/dashboard/preview/status")
+def preview_status() -> dict:
+    return {"active": _preview_active, "limit": PREVIEW_LIMIT}
+
+
+@app.get("/api/dashboard/preview", summary="Live MJPEG preview of one channel")
+def preview(
+    request: Request,
+    channel_code: str = Query(..., min_length=1),
+    stream_type: str = Query("2", pattern="^[12]$"),
+) -> StreamingResponse:
+    """Relay the sub stream as MJPEG; closing the <img> stops ffmpeg."""
+    if not RTSP_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="未配置 EVO_BASE/EVO_PASSWORD，实时预览不可用")
+    if not _preview_acquire():
+        raise HTTPException(
+            status_code=429,
+            detail=f"同时预览已达 {PREVIEW_LIMIT} 路，请关闭其他预览再试")
+    try:
+        url, session = _live_rtsp(channel_code, stream_type)
+    except Exception as exc:  # platform offline, login failure, bad channel
+        _preview_release()
+        raise HTTPException(status_code=502, detail=f"取流失败：{exc}") from exc
+
+    cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+        "-nostdin", "-fflags", "nobuffer", "-flags", "low_delay",
+        "-avioflags", "direct", "-rtsp_transport", "tcp",
+        "-probesize", "1000000", "-analyzeduration", "0",
+        "-i", url, "-an", "-vf", f"scale={PREVIEW_WIDTH}:-2",
+        "-r", str(PREVIEW_FPS), "-q:v", str(PREVIEW_QUALITY),
+        "-flush_packets", "1", "-f", "mpjpeg", "-",
+    ]
+
+    async def frames():
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        released = False
+
+        async def cleanup():
+            # Called by the disconnect watcher and by finally; must run once.
+            nonlocal released
+            if released:
+                return
+            released = True
+            # No awaits here: this also runs while the task is being cancelled
+            # (client disconnect), where any await would abort the cleanup.
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            finally:
+                _preview_release()
+            try:
+                _stop_stream(channel_code, session)
+            except Exception:
+                pass
+
+        async def watch():
+            # Starlette may abandon the iterator without closing it, so the
+            # finally block alone is not reliable; poll the disconnect.
+            while True:
+                if await request.is_disconnected():
+                    await cleanup()
+                    return
+                await asyncio.sleep(0.5)
+
+        watcher = asyncio.create_task(watch())
+        try:
+            while True:
+                chunk = await proc.stdout.read(16384)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            watcher.cancel()
+            await cleanup()
+
+    return StreamingResponse(
+        frames(),
+        media_type="multipart/x-mixed-replace; boundary=ffmpeg",
+        headers={"Cache-Control": "no-store"})
 
 
 def _valid_date(value: str) -> str:
@@ -310,6 +499,23 @@ def frame(
     path = data.frame_path(index, channel_code, frame_dir)
     if path is None:
         raise HTTPException(status_code=404, detail="未找到该通道的抓帧图片")
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/dashboard/new-frame", summary="HK03 frame for one channel")
+def new_frame(
+    index: int = Query(..., ge=0, description="channel index"),
+    channel_code: str = Query(..., description="channel code"),
+    frame_dir: str | None = Query(
+        None, description="per-round folder, e.g. round_0004_20261022_125603"),
+) -> FileResponse:
+    path = data.hk03_frame_path(index, channel_code, frame_dir)
+    if path is None:
+        raise HTTPException(status_code=404, detail="未找到该通道的新平台抓帧图片")
     return FileResponse(
         path,
         media_type="image/jpeg",

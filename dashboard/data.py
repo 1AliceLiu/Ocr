@@ -39,6 +39,8 @@ ERROR_IMAGE_DIR = Path(os.getenv(
     "ERROR_IMAGE_DIR", str(PROJECT_ROOT / "snapshots" / "osd_error")))
 ARCHIVE_DIR = Path(os.getenv(
     "ARCHIVE_DIR", str(PROJECT_ROOT / "Logs")))
+OUTPUT_LOG_FILE = Path(os.getenv(
+    "OUTPUT_LOG_FILE", str(PROJECT_ROOT / "output.txt")))
 
 HISTORY_ROUNDS = os.getenv("HISTORY_ROUNDS", "1").strip().lower() not in (
     "0", "false", "no", "off")
@@ -328,6 +330,18 @@ def frame_exists(index: int | None, channel_code: str,
     return frame_path(index, channel_code, frame_dir) is not None
 
 
+def hk03_frame_path(index: int | None, channel_code: str,
+                    frame_dir: str | None = None) -> Path | None:
+    """The HK03 frame stored next to the old frame in its round folder."""
+    name = _frame_filename(index, channel_code)
+    if not name or not frame_dir:
+        return None
+    if not re.fullmatch(r"round_\d{4,}_\d{8}_\d{6}", frame_dir):
+        return None
+    path = ERROR_IMAGE_DIR / frame_dir / f"hk03_{name}"
+    return path if path.is_file() else None
+
+
 def _load_channel_index() -> dict[str, Any]:
     """channelCode -> channel/device names, cached by file version."""
     global _channel_cache
@@ -350,10 +364,13 @@ def _load_channel_index() -> dict[str, Any]:
                 if not code:
                     continue
                 channel_name = (row.get("通道名称") or "").strip()
+                org_path = (row.get("组织路径") or "").strip()
                 channels[code] = {
                     "channelName": channel_name,
                     "deviceName": ((row.get("设备名称") or "").strip()
                                    or channel_name or code),
+                    "project": org_path.split("/", 1)[0],
+                    "orgPath": org_path,
                 }
     except OSError:
         return empty
@@ -460,6 +477,29 @@ def _done_view(done: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def _current_progress(started_at: str | None) -> dict[str, int]:
+    """Count rows written to output.txt for the current monitor round."""
+    if not started_at or not OUTPUT_LOG_FILE.exists():
+        return {}
+    processed = ok = timeouts = 0
+    try:
+        with OUTPUT_LOG_FILE.open(
+                encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                parts = line.rstrip("\r\n").split("\t")
+                if len(parts) < 7 or parts[0] < started_at:
+                    continue
+                processed += 1
+                status = parts[6]
+                if status == "OK":
+                    ok += 1
+                elif status.startswith("CAPTURE_FAILED"):
+                    timeouts += 1
+    except OSError:
+        return {}
+    return {"processed": processed, "ok": ok, "timeouts": timeouts}
+
+
 def _live_groups(date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     blocks = _load_live_blocks()
     groups: list[dict[str, Any]] = []
@@ -504,6 +544,7 @@ def _live_groups(date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             "startedAt": in_progress_block["startedAt"],
             "rowCount": sum(1 for r in in_progress_block["rows"]
                             if r["time"][:10] == date),
+            **_current_progress(in_progress_block["startedAt"]),
         }
 
     updated_at = None
@@ -1237,6 +1278,7 @@ def get_results(
         groups, meta = _live_groups(date)
     else:
         groups, meta = _history_groups(date)
+    channel_index = _load_channel_index()
 
     confirmations = {
         row["row_key"]: row
@@ -1313,6 +1355,7 @@ def get_results(
         frame_dir = group.get("frameDir")
         for row in group["rows"]:
             row["hasImage"] = False
+            row["hasNewImage"] = False
             row.pop("frameDir", None)
             if (is_today
                     and (row["status"] or "").upper().startswith("MISMATCH")):
@@ -1320,7 +1363,13 @@ def get_results(
                     row["index"], row["channelCode"], frame_dir)
                 if row["hasImage"]:
                     row["frameDir"] = frame_dir
+                row["hasNewImage"] = hk03_frame_path(
+                    row["index"], row["channelCode"], frame_dir) is not None
 
+            info = channel_index["channels"].get(
+                (row.get("channelCode") or "").strip())
+            row["project"] = (info.get("project", "") if info else "")
+            row["projectPath"] = (info.get("orgPath", "") if info else "")
             key = _row_id(row)
             confirmation = confirmations.get(key)
             row["rowKey"] = key

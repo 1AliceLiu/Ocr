@@ -68,7 +68,8 @@ START_VIDEO = "/evo-apigw/admin/API/MTS/Video/StartVideo"
 STOP_VIDEO = "/evo-apigw/admin/API/MTS/Video/StopVideo"
 
 # Login endpoint variants seen on Dahua platforms; the first one that answers
-# with a public key / token wins.
+# with a public key / token wins.  The bare prefix answers on both the old and
+# the HK03 platform, so try it first: the /1.0.0 token path stalls ~30s here.
 OAUTH_PREFIXES = ("/evo-apigw/evo-oauth", "/evo-apigw/evo-oauth/1.0.0")
 TOKEN_EXPIRED_CODES = {"27001007", "28110015", "1002", "401"}
 
@@ -221,8 +222,9 @@ class Platform:
                 try:
                     res = self.http.get(
                         self.base + candidate + suffix,
-                        params={"t": int(time.time() * 1000)},
-                        verify=self.verify, timeout=20)
+                        params={"username": self.user,
+                                "t": int(time.time() * 1000)},
+                        verify=self.verify, timeout=(5, 20))
                     data = self._load(res).get("data") or {}
                     if data.get("publicKey"):
                         pub_b64, prefix = data["publicKey"], candidate
@@ -256,7 +258,9 @@ class Platform:
                           "grant_type": "password", "client_id": "web_client",
                           "client_secret": "web_client"})
 
-        prefixes = [prefix] if prefix else list(OAUTH_PREFIXES)
+        # The public key and token paths do not always share the same version
+        # prefix (ICC V5 serves the key under /1.0.0 and the token without it).
+        prefixes = list(OAUTH_PREFIXES)
         last = {}
         for cand in prefixes:
             for form in forms:
@@ -264,7 +268,7 @@ class Platform:
                     res = self.http.post(
                         self.base + cand + "/oauth/token",
                         headers={"Content-Type": "application/x-www-form-urlencoded"},
-                        data=form, verify=self.verify, timeout=30)
+                        data=form, verify=self.verify, timeout=(5, 30))
                 except requests.RequestException as exc:
                     last = {"errMsg": str(exc)}
                     continue
@@ -290,7 +294,7 @@ class Platform:
                     data={"refresh_token": self.refresh_token,
                           "grant_type": "refresh_token",
                           "client_id": "web_client", "client_secret": "web_client"},
-                    verify=self.verify, timeout=30)
+                    verify=self.verify, timeout=(5, 30))
                 body = self._load(res)
             except requests.RequestException:
                 continue
@@ -614,9 +618,18 @@ def main() -> None:
         return
 
     dev_by_code = {d.get("deviceCode"): d for d in devices}
+    if not nodes:
+        # The page APIs only return ownerCode; names live in the org tree.
+        try:
+            nodes = p.tree(args.root, args.root)
+            print(f"org tree: {len(nodes)} nodes", flush=True)
+        except Exception as exc:  # noqa: BLE001 - keep the pull usable
+            print(f"org tree unavailable ({exc}); org paths will be empty",
+                  flush=True)
     for ch in channels:
         ch["_deviceName"] = dev_by_code.get(ch.get("deviceCode"), {}).get("deviceName", "")
-        ch["_org"] = org_path(nodes, ch.get("pId", "")) if nodes else ""
+        org_id = ch.get("ownerCode") or ch.get("pId", "")
+        ch["_org"] = org_path(nodes, org_id) if nodes else ""
 
     write_csv(args.outdir / "devices.csv", devices, [
         ("deviceCode", "设备编码"), ("deviceName", "设备名称"),

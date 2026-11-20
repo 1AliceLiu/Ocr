@@ -11,6 +11,20 @@
 
 代码：`scripts/daily_refresh.py`；服务：compose 里的 `osd-daily`。
 
+同一个 `osd-daily` 进程每天 **北京时间 06:00** 还会刷新 `out-hk03/` 下的
+`channels.csv`、`devices.csv`、`streams.txt`，并清理前一天及更早的
+`snapshots/osd_error/**/hk03_*.jpg`。HK03 刷新不需要重启任何监控。
+
+06:30 旧平台表更新后，还会自动做一次 **HK03 交集抑制**：
+
+1. 按旧平台 `设备名称` = HK03 `通道名称` 找交集；
+2. **所有交集设备全部写入** `state/hk03_cancelled.json`；
+3. 停止 `osd20`，删除当天 `output/osd_error.txt` 中这些设备的旧告警行，
+   再启动 `osd20`；启动后这些通道直接跳过 OSD 检测。
+
+这一步由 `scripts/daily_hk03_suppress.py` 完成，交集设备不再要求 HK03 OCR
+通过。HK03 也发生串流的设备同样抑制，画面可以单独放到 `temp/` 复查。
+
 刷新前还会把 `output/osd_error.txt` 中“按保留规则将要删除的旧行”归档到
 `Logs/YYYYMMDD_osd_error.csv`，作为 `osd-error-prune` 的保险；归档本身不删除
 数据。详见 `docs/osd_error_archive.md`。
@@ -30,7 +44,7 @@ docker compose logs -f osd-daily
 启动后日志会打印下一次执行时间：
 
 ```
-2026-10-21 06:50:03 next refresh at 06:30 Beijing (in 23.67 h)
+2026-10-21 06:50:03 next refresh: hk03 (old 06:30, HK03 06:00) in 23.17 h
 ```
 
 ## 2. 手动验证（推荐先跑这个）
@@ -47,6 +61,14 @@ docker compose exec osd-daily \
 # 只更新 streams.txt，不重启（下一轮开始前你自己重启）
 docker compose exec osd-daily \
   python /work/scripts/daily_refresh.py --once --no-restart
+
+# 只验证 HK03 拉取，不替换 out-hk03
+docker compose exec osd-daily \
+  python /work/scripts/daily_refresh.py --once-hk03 --dry-run
+
+# 立即执行一次 HK03 同步
+docker compose exec osd-daily \
+  python /work/scripts/daily_refresh.py --once-hk03
 ```
 
 正常输出示例：

@@ -56,25 +56,6 @@ services:
         - action: rebuild
           path: ./EasyOCR/Dockerfile.dev
 
-  monitor:
-    build: *easyocr-build
-    image: easyocr-dev:latest
-    init: true
-    working_dir: /work
-    environment:
-      PYTHONUNBUFFERED: "1"
-      EASYOCR_MODULE_PATH: /root/.EasyOCR
-      OPENCV_FFMPEG_LOGLEVEL: "quiet"
-    volumes:
-      - ./:/work
-      - easyocr-models:/root/.EasyOCR
-    command:
-      - python
-      - /work/scripts/rtsp_osd_monitor.py
-      - --interval
-      - "${MONITOR_INTERVAL:-60}"
-    restart: unless-stopped
-
   # Token-aware OSD monitor for every channel in out/streams.txt (1521 of them),
   # 1080p main stream. --limit 0 would also mean "no limit".
   # Start/stop:  docker compose up -d osd20  /  docker compose stop osd20
@@ -150,7 +131,8 @@ services:
       - /work/snapshots/osd_error
     restart: unless-stopped
 
-  # 每天北京时间 06:30 重新拉取 out/streams.txt，然后重启 osd20 让新列表生效。
+  # 每天北京时间 06:30 重新拉取 out/streams.txt 并重启 osd20；
+  # 同一进程每天 06:00 同步 out-hk03/ 下的 channels/devices/streams。
   # 需要挂载 /var/run/docker.sock（用来重启 osd20），详见 docs/osd_daily_refresh.md
   osd-daily:
     build: *easyocr-build
@@ -161,6 +143,9 @@ services:
       EVO_BASE: ${EVO_BASE}
       EVO_USER: ${EVO_USER}
       EVO_PASSWORD: ${EVO_PASSWORD}
+      HK03_BASE: ${HK03_BASE:-https://monitor.mediumvis.com:8092}
+      HK03_USER: ${HK03_USER:-}
+      HK03_PASSWORD: ${HK03_PASSWORD:-}
     volumes:
       - ./:/work
       - /var/run/docker.sock:/var/run/docker.sock
@@ -170,6 +155,8 @@ services:
       - --watch
       - --time
       - "${REFRESH_TIME:-06:30}"
+      - --hk03-time
+      - "${HK03_REFRESH_TIME:-06:00}"
     restart: unless-stopped
 
   # 结果看板：首页展示 output/osd_error.txt，支持按日期查归档、
@@ -186,6 +173,7 @@ services:
     environment:
       OSD_ERROR_FILE: /work/output/osd_error.txt
       OSD_ROUNDS_FILE: /work/output/osd_rounds.csv
+      OUTPUT_LOG_FILE: /work/output.txt
       CHANNELS_FILE: /work/out/channels.csv
       ERROR_IMAGE_DIR: /work/snapshots/osd_error
       ARCHIVE_DIR: /work/Logs
@@ -196,6 +184,10 @@ services:
       # 内网实例刻意不启用登录；公网访问请走 osd-dashboard-public。
       DASHBOARD_USER: ""
       DASHBOARD_PASSWORD: ""
+      # 实时 RTSP 取流（只有内网实例配置账号；公网实例不暴露该列）
+      EVO_BASE: ${EVO_BASE}
+      EVO_USER: ${EVO_USER}
+      EVO_PASSWORD: ${EVO_PASSWORD}
     volumes:
       - ./:/work:ro
       - ./state:/state
@@ -224,6 +216,7 @@ services:
     environment:
       OSD_ERROR_FILE: /work/output/osd_error.txt
       OSD_ROUNDS_FILE: /work/output/osd_rounds.csv
+      OUTPUT_LOG_FILE: /work/output.txt
       CHANNELS_FILE: /work/out/channels.csv
       ERROR_IMAGE_DIR: /work/snapshots/osd_error
       ARCHIVE_DIR: /work/Logs
@@ -231,6 +224,12 @@ services:
       DASHBOARD_PAGE_SIZE: "50"
       STREAM_TOP_N: "50"
       CONFIRM_DB: /state/dashboard.db
+      EVO_BASE: ${EVO_BASE}
+      EVO_USER: ${EVO_USER}
+      EVO_PASSWORD: ${EVO_PASSWORD}
+      PREVIEW_WIDTH: "640"
+      PREVIEW_FPS: "4"
+      PREVIEW_QUALITY: "6"
       DASHBOARD_USER: ${DASHBOARD_USER:-osd}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
       DASHBOARD_SESSION_HOURS: "12"
@@ -280,8 +279,6 @@ services:
     volumes:
       - ./:/work:ro
     restart: unless-stopped
-    depends_on:
-      - monitor
     healthcheck:
       test:
         - CMD

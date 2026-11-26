@@ -1,0 +1,12 @@
+FROM easyocr-dev:latest
+
+RUN pip install --no-cache-dir 'fastapi>=0.110,<1.0' 'uvicorn>=0.29,<1.0'
+
+WORKDIR /work
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/work/scripts:/home/EasyOCR \
+    EASYOCR_MODULE_PATH=/root/.EasyOCR
+
+EXPOSE 8000
+CMD ["uvicorn", "ocr_api:app", "--host", "0.0.0.0", "--port", "8000"]

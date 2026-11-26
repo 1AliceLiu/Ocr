@@ -17,6 +17,8 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import parse_qs
 
 import imageio_ffmpeg
@@ -31,6 +33,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 import data
 
@@ -51,6 +54,11 @@ EVO_BASE = os.getenv("EVO_BASE", "")
 EVO_USER = os.getenv("EVO_USER", "")
 EVO_PASSWORD = os.getenv("EVO_PASSWORD", "")
 RTSP_ENABLED = bool(EVO_BASE and EVO_PASSWORD)
+
+# OCR API is reachable by service name on the compose network; /ocr/* is
+# proxied so the public Funnel URL can use it without the dashboard login.
+OCR_API_URL = os.getenv("OCR_API_URL", "http://ocr-api:8000").rstrip("/")
+OCR_API_TIMEOUT = max(10, int(os.getenv("OCR_API_TIMEOUT", "180")))
 _rtsp_client = None
 _rtsp_lock = threading.Lock()
 PREVIEW_LIMIT = 8
@@ -225,7 +233,8 @@ async def dashboard_middleware(request: Request, call_next):
     # The healthcheck and the login page itself stay public.  Everything else
     # is behind a session cookie when a password is configured (the public
     # dashboard instance).  The internal instance runs without a password.
-    if DASHBOARD_PASSWORD and path not in ("/health", "/login"):
+    if (DASHBOARD_PASSWORD and path not in ("/health", "/login")
+            and not path.startswith("/ocr/")):
         if not _authorized(request):
             if path.startswith("/api/"):
                 return JSONResponse({"detail": "需要登录"}, status_code=401)
@@ -233,6 +242,7 @@ async def dashboard_middleware(request: Request, call_next):
 
     response = await call_next(request)
     if (path.startswith("/api/") or path.startswith("/static/")
+            or path.startswith("/ocr/")
             or path in ("/login", "/logout")):
         response.headers["Cache-Control"] = "no-store"
     return response
@@ -244,6 +254,52 @@ def health() -> dict:
         "status": "ok",
         "time": data.now_beijing().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def _ocr_forward(url: str, method: str, headers: dict[str, str],
+                 body: bytes | None) -> Response:
+    request = urllib_request.Request(
+        url, data=body, method=method, headers=headers)
+    try:
+        with urllib_request.urlopen(request, timeout=OCR_API_TIMEOUT) as response:
+            return Response(
+                content=response.read(),
+                status_code=response.status,
+                media_type=response.headers.get_content_type(),
+                headers={"Cache-Control": "no-store"},
+            )
+    except urllib_error.HTTPError as exc:
+        return Response(
+            content=exc.read(),
+            status_code=exc.code,
+            media_type=exc.headers.get_content_type(),
+            headers={"Cache-Control": "no-store"},
+        )
+    except Exception as exc:  # noqa: BLE001 - network/timeout
+        return JSONResponse(
+            {"detail": f"OCR API 不可达：{type(exc).__name__}"},
+            status_code=502,
+            headers={"Cache-Control": "no-store"},
+        )
+
+
+@app.api_route("/ocr/{path:path}", methods=["GET", "POST"],
+               include_in_schema=False)
+async def ocr_proxy(path: str, request: Request) -> Response:
+    # Public Funnel/Cloudflare entry for the OCR API.  The OCR API's own
+    # X-API-Key is forwarded and checked by ocr-api; the dashboard login is
+    # deliberately not required for this prefix.
+    url = f"{OCR_API_URL}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+    body = await request.body() if request.method != "GET" else None
+    headers = {}
+    for name in ("content-type", "x-api-key"):
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    return await run_in_threadpool(
+        _ocr_forward, url, request.method, headers, body)
 
 
 @app.get("/login", response_class=HTMLResponse, include_in_schema=False)

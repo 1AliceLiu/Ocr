@@ -4,3 +4,4 @@ osd20 用于检测的主程序
 config/blocked_channels.txt 用于屏蔽旧平台通道编码前缀，一行一个，屏蔽后不抓帧也不查HK03
 osd-error-prune 用于 删掉orc/output/osd_error.txt中前一天的数据
 api 用于调用osd_error.txt中的结果
+ocr-api 用于给同事提供单通道 OSD OCR HTTP API（图片或 streams.txt 行），文档见 docs/ocr_api.md

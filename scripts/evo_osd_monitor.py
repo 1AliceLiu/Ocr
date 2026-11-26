@@ -625,10 +625,14 @@ class Monitor:
                 return True
         return False
 
-    def one(self, channel: dict) -> dict:
+    def one(self, channel: dict, url: str | None = None,
+            provided_frames: list | None = None,
+            expected: str | None = None) -> dict:
         code = channel["channelCode"]
-        expected = (self.device_names.get(code)
+        expected = (expected or self.device_names.get(code)
                     or expected_code(channel["name"]))
+        if expected:
+            self.expected_codes.add(expected)
         result = {
             "index": channel["index"],
             "channelCode": code,
@@ -656,22 +660,36 @@ class Monitor:
         # the OCR budget, and a bad read must not turn into a long capture loop.
         capture_left = 1 + max(0, self.args.retries)
         quality_left = max(0, self.args.ocr_retries)
+        if url is not None or provided_frames is not None:
+            # Caller-supplied stream/frame is single-use; do not retry it.
+            capture_left = 1
+            quality_left = 0
         while capture_left > 0:
             capture_left -= 1
-            body, data, url = self._start(code)
-            try:
-                if not is_ok(body) or not url:
-                    reason = f"StartVideo({body.get('code')})"
-                    continue
-                target = (self.save_dir / safe_name(channel["index"], code)
-                          if self.save_dir else
-                          Path(tempfile.gettempdir()) / f"osd_{channel['index']}.jpg")
-                frames = grab_frames(self.ffmpeg, url, self.args.timeout, target,
-                                     skip_frames=self.args.skip_frames,
+            target = (self.save_dir / safe_name(channel["index"], code)
+                      if self.save_dir else
+                      Path(tempfile.gettempdir()) / f"osd_{channel['index']}.jpg")
+            if provided_frames is not None:
+                frames = provided_frames
+            elif url is not None:
+                stream_url = url
+                frames = grab_frames(self.ffmpeg, stream_url, self.args.timeout,
+                                     target, skip_frames=self.args.skip_frames,
                                      count=self.args.frames,
                                      keyframes=self.args.frame_source == "key")
-            finally:
-                self._stop(code, data.get("session"))
+            else:
+                body, data, stream_url = self._start(code)
+                try:
+                    if not is_ok(body) or not stream_url:
+                        reason = f"StartVideo({body.get('code')})"
+                        continue
+                    frames = grab_frames(self.ffmpeg, stream_url,
+                                         self.args.timeout, target,
+                                         skip_frames=self.args.skip_frames,
+                                         count=self.args.frames,
+                                         keyframes=self.args.frame_source == "key")
+                finally:
+                    self._stop(code, data.get("session"))
             if not frames:
                 reason = "capture timeout"
                 continue
@@ -854,6 +872,10 @@ class Monitor:
         if self.error_dir and result["status"] != "OK":
             self.save_anomaly(channel, best_frame)
         return result
+
+    def one_image(self, channel: dict, frame, expected: str | None = None) -> dict:
+        """Run the same OCR/verdict path on an already captured frame."""
+        return self.one(channel, provided_frames=[frame], expected=expected)
 
 
 def main() -> None:

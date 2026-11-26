@@ -181,6 +181,7 @@ services:
       DASHBOARD_PAGE_SIZE: "50"
       STREAM_TOP_N: "50"
       CONFIRM_DB: /state/dashboard.db
+      OCR_API_URL: http://ocr-api:8000
       # 内网实例刻意不启用登录；公网访问请走 osd-dashboard-public。
       DASHBOARD_USER: ""
       DASHBOARD_PASSWORD: ""
@@ -224,6 +225,7 @@ services:
       DASHBOARD_PAGE_SIZE: "50"
       STREAM_TOP_N: "50"
       CONFIRM_DB: /state/dashboard.db
+      OCR_API_URL: http://ocr-api:8000
       EVO_BASE: ${EVO_BASE}
       EVO_USER: ${EVO_USER}
       EVO_PASSWORD: ${EVO_PASSWORD}
@@ -288,6 +290,50 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # 给同事的单通道 OSD OCR API；输入 out/streams.txt 一行。
+  # 文档：docs/ocr_api.md；接口：POST /api/v1/ocr，X-API-Key 鉴权。
+  ocr-api:
+    build:
+      context: ./scripts
+      dockerfile: Dockerfile.ocr-api
+    image: easyocr-dev-ocr-api:latest
+    init: true
+    working_dir: /work
+    ports:
+      - "${OCR_API_PORT:-8014}:8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /work/scripts:/home/EasyOCR
+      EASYOCR_MODULE_PATH: /root/.EasyOCR
+      CHANNELS_FILE: /work/out/channels.csv
+      OSD_PROFILE_FILE: /work/config/osd_profiles.json
+      OCR_API_KEY: ${OCR_API_KEY:-}
+      OCR_GPU: "${OCR_GPU:-0}"
+      EVO_BASE: ${EVO_BASE}
+      EVO_USER: ${EVO_USER}
+      EVO_PASSWORD: ${EVO_PASSWORD}
+    volumes:
+      # 只挂 OCR 需要的只读目录；不要把仓库根目录（含 .env）挂进来。
+      - ./scripts:/work/scripts:ro
+      - ./out:/work/out:ro
+      - ./config:/work/config:ro
+      # 调试用：保存最近 10 张左下角 OSD 截图
+      - ./temp/ocr_api_osd:/work/temp/ocr_api_osd
+      # 调试用：保存输入原图 + ROI 裁剪 + meta.csv，排查 OSD 完整性
+      - ./temp/ocr_api_debug:/work/temp/ocr_api_debug
+      - easyocr-models:/root/.EasyOCR
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
 
 volumes:
   easyocr-models:
